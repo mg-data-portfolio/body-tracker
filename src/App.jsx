@@ -1068,18 +1068,17 @@ export default function App() {
     if (!review || !cycle) return;
     
     // Save new cycle with updated locked target
+    // CRITICAL: syncedPhaseDate must match cycle.syncedPhaseDate (not today)
+    // Setting it to today causes phaseAnchorDrifted = true, which makes reviewDue
+    // recalculate from the original phase change date (14+ days ago) instead of today
     const newCycle = {
       anchorDate: today,
       lockedTarget: review.proposed,
-      syncedPhaseDate: today // Reset sync date to today
+      syncedPhaseDate: cycle.syncedPhaseDate
     };
     saveCycle(newCycle);
     setReviewConfirming(false);
-    
-    // Force a slight delay to ensure state updates before showing toast
-    setTimeout(() => {
-      showToast(review.delta === 0 ? "Cycle reset — holding target" : `Target → ${review.proposed.toLocaleString()} kcal`);
-    }, 100);
+    showToast(review.delta === 0 ? "Cycle reset — holding target" : `Target → ${review.proposed.toLocaleString()} kcal`);
   };
   const cancelReviewConfirm = () => {
     setReviewConfirming(false);
