@@ -719,8 +719,12 @@ export default function App() {
     : null;
   const reviewDue = cycle != null && daysSinceAnchor != null && daysSinceAnchor >= REVIEW_DAYS;
 
-  // The number the user follows: locked target while a cycle is mid-flight, else the formula target
-  const target = (cycle && !reviewDue) ? cycle.lockedTarget : formulaTarget;
+  // LOCKED TARGET LOGIC:
+  // - If an active cycle exists AND review is NOT due: use locked target (don't let TDEE changes override)
+  // - If review IS due: show formula target (so user can see the proposal)
+  // - If no cycle: use formula target
+  // The ONLY ways to change target are: (1) change phase/magnitude, or (2) click Apply on review
+  const target = (cycle && !reviewDue && cycle.lockedTarget != null) ? cycle.lockedTarget : formulaTarget;
 
   // Compute the review proposal when due
   let review = null;
