@@ -459,6 +459,7 @@ export default function App() {
   // Goal: { weightKg, date } | null
   const [goal, setGoal] = useState(null);
   const [goalOpen, setGoalOpen] = useState(false);
+  const [reviewConfirming, setReviewConfirming] = useState(false);
   // Phase history: array of { date, phase, magnitude }
   const [phaseHist, setPhaseHist] = useState([]);
   const fileInputRef = useRef(null);
@@ -749,10 +750,21 @@ export default function App() {
         if (actualPerWeek < goalPerWeek - tol) delta = +ADJUST_STEP;
         else if (actualPerWeek > goalPerWeek + tol) delta = -ADJUST_STEP;
       }
+      // Calculate "actual current target" from most recent entry (vs-target)
+      // This is robust against stale cycle data from multiple Apply clicks
+      let currentTarget = cycle.lockedTarget; // fallback
+      const latestEntryKey = sorted.length > 0 ? sorted[sorted.length - 1] : null;
+      if (latestEntryKey) {
+        const latestEntry = entries[latestEntryKey];
+        if (latestEntry.calories != null && latestEntry.vsTarget != null) {
+          currentTarget = latestEntry.calories + latestEntry.vsTarget;
+        }
+      }
+      
       review = {
         actualPerWeek, goalPerWeek, offBy, delta,
-        current: cycle.lockedTarget,
-        proposed: cycle.lockedTarget + delta,
+        current: currentTarget,
+        proposed: currentTarget + delta,
         onTrack: delta === 0,
         weighIns: wPts.length,
       };
@@ -1056,9 +1068,19 @@ export default function App() {
   }, [loaded]);
 
   const acceptReview = () => {
+    // First click: show confirmation dialog
+    if (!reviewConfirming) {
+      setReviewConfirming(true);
+      return;
+    }
+    // Second click: confirm and save (double-click protection)
     if (!review) return;
     saveCycle({ anchorDate: today, lockedTarget: review.proposed, syncedPhaseDate: cycle.syncedPhaseDate });
+    setReviewConfirming(false);
     showToast(review.delta === 0 ? "Cycle reset — holding target" : `Target → ${review.proposed.toLocaleString()} kcal`);
+  };
+  const cancelReviewConfirm = () => {
+    setReviewConfirming(false);
   };
   const holdReview = () => {
     if (!cycle) return;
@@ -1776,10 +1798,18 @@ export default function App() {
             </div>
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
               {!review.onTrack && (
-                <button onClick={acceptReview}
-                  style={{ background: "#fbbf24", color: "var(--surface)", border: "none", borderRadius: 6, padding: "7px 14px", fontSize: 11, fontWeight: 700, letterSpacing: "0.03em", cursor: "pointer" }}>
-                  Apply {review.proposed.toLocaleString()}
-                </button>
+                <>
+                  <button onClick={acceptReview}
+                    style={{ background: reviewConfirming ? "#dc2626" : "#fbbf24", color: reviewConfirming ? "#fff" : "var(--surface)", border: "none", borderRadius: 6, padding: "7px 14px", fontSize: 11, fontWeight: 700, letterSpacing: "0.03em", cursor: "pointer", transition: "all 150ms" }}>
+                    {reviewConfirming ? "Confirm — lock in?" : `Apply ${review.proposed.toLocaleString()}`}
+                  </button>
+                  {reviewConfirming && (
+                    <button onClick={cancelReviewConfirm}
+                      style={{ background: "transparent", color: "var(--text-soft)", border: "1px solid var(--border-strong)", borderRadius: 6, padding: "7px 14px", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
+                      Cancel
+                    </button>
+                  )}
+                </>
               )}
               <button onClick={review.onTrack ? acceptReview : holdReview}
                 style={{ background: review.onTrack ? "#34d399" : "transparent", color: review.onTrack ? "var(--bg)" : "var(--text-soft)", border: review.onTrack ? "none" : "1px solid var(--border-strong)", borderRadius: 6, padding: "7px 14px", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
