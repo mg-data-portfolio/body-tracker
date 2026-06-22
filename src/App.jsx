@@ -1068,13 +1068,14 @@ export default function App() {
     if (!review || !cycle) return;
     
     // Save new cycle with updated locked target
-    // CRITICAL: syncedPhaseDate must match cycle.syncedPhaseDate (not today)
-    // Setting it to today causes phaseAnchorDrifted = true, which makes reviewDue
-    // recalculate from the original phase change date (14+ days ago) instead of today
+    // CRITICAL: syncedPhaseDate must equal latestPhaseChangeDate exactly
+    // If it doesn't match, phaseAnchorDrifted=true and effectiveAnchorDate
+    // recalculates from the original phase change date (14+ days ago),
+    // keeping reviewDue=true and the review box permanently visible
     const newCycle = {
       anchorDate: today,
       lockedTarget: review.proposed,
-      syncedPhaseDate: cycle.syncedPhaseDate
+      syncedPhaseDate: latestPhaseChangeDate ?? cycle.syncedPhaseDate
     };
     saveCycle(newCycle);
     setReviewConfirming(false);
@@ -1085,7 +1086,7 @@ export default function App() {
   };
   const holdReview = () => {
     if (!cycle) return;
-    saveCycle({ anchorDate: today, lockedTarget: cycle.lockedTarget, syncedPhaseDate: cycle.syncedPhaseDate });
+    saveCycle({ anchorDate: today, lockedTarget: target, syncedPhaseDate: latestPhaseChangeDate ?? cycle.syncedPhaseDate });
     showToast("Holding current target");
   };
 
