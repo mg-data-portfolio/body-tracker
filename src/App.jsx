@@ -750,21 +750,12 @@ export default function App() {
         if (actualPerWeek < goalPerWeek - tol) delta = +ADJUST_STEP;
         else if (actualPerWeek > goalPerWeek + tol) delta = -ADJUST_STEP;
       }
-      // Calculate "actual current target" from most recent entry (vs-target)
-      // This is robust against stale cycle data from multiple Apply clicks
-      let currentTarget = cycle.lockedTarget; // fallback
-      const latestEntryKey = sorted.length > 0 ? sorted[sorted.length - 1] : null;
-      if (latestEntryKey) {
-        const latestEntry = entries[latestEntryKey];
-        if (latestEntry.calories != null && latestEntry.vsTarget != null) {
-          currentTarget = latestEntry.calories + latestEntry.vsTarget;
-        }
-      }
-      
+      // Review uses the SAME target variable as daily display — single source of truth
+      // This ensures consistency: both show the same "current" value
       review = {
         actualPerWeek, goalPerWeek, offBy, delta,
-        current: currentTarget,
-        proposed: currentTarget + delta,
+        current: target,
+        proposed: target + delta,
         onTrack: delta === 0,
         weighIns: wPts.length,
       };
