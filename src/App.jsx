@@ -1065,10 +1065,21 @@ export default function App() {
       return;
     }
     // Second click: confirm and save (double-click protection)
-    if (!review) return;
-    saveCycle({ anchorDate: today, lockedTarget: review.proposed, syncedPhaseDate: cycle.syncedPhaseDate });
+    if (!review || !cycle) return;
+    
+    // Save new cycle with updated locked target
+    const newCycle = {
+      anchorDate: today,
+      lockedTarget: review.proposed,
+      syncedPhaseDate: today // Reset sync date to today
+    };
+    saveCycle(newCycle);
     setReviewConfirming(false);
-    showToast(review.delta === 0 ? "Cycle reset — holding target" : `Target → ${review.proposed.toLocaleString()} kcal`);
+    
+    // Force a slight delay to ensure state updates before showing toast
+    setTimeout(() => {
+      showToast(review.delta === 0 ? "Cycle reset — holding target" : `Target → ${review.proposed.toLocaleString()} kcal`);
+    }, 100);
   };
   const cancelReviewConfirm = () => {
     setReviewConfirming(false);
