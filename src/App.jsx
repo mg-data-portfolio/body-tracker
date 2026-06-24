@@ -839,23 +839,10 @@ export default function App() {
   };
   const historicalTargetCache = {};
   const targetForDate = (dateStr) => {
-    if (historicalTargetCache[dateStr] !== undefined) return historicalTargetCache[dateStr];
-    const { phase: pOnDate, magnitude: mOnDate } = phaseOnDate(dateStr);
-    const asOfTs = new Date(dateStr + "T23:59:59").getTime();
-    // TDEE as it would have been measured using only data up to this date
-    const histTdeeResult = calcTDEEWindow(datedAll, 14, asOfTs) || calcTDEEWindow(datedAll, 28, asOfTs);
-    let histTdee = histTdeeResult?.tdee ?? null;
-    if (histTdee == null) {
-      // Fall back to baseline using the nearest known weight up to that date
-      let nearestWeight = null;
-      for (let i = datedAll.length - 1; i >= 0; i--) {
-        if (datedAll[i].ts <= asOfTs && datedAll[i].weight != null) { nearestWeight = datedAll[i].weight; break; }
-      }
-      histTdee = calcBaselineTDEE(profile, nearestWeight ?? macroWeight);
-    }
-    const t = calcTarget(histTdee, pOnDate, mOnDate);
-    historicalTargetCache[dateStr] = t;
-    return t;
+    // Always use the current locked target for vs-target calculations
+    // This ensures log rows are consistent with the daily target display
+    // Historical formula targets are unreliable as TDEE changes over time
+    return target;
   };
 
   // ── Report: resolved date range ──
