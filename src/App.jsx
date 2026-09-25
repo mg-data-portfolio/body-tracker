@@ -8,6 +8,10 @@ const CYCLE_KEY = "body-tracker-cycle";
 const GOAL_KEY = "body-tracker-goal";
 const PHASEHIST_KEY = "body-tracker-phasehist";
 const THEME_KEY = "body-tracker-theme";
+const WATER_KEY = "body-tracker-water";
+const REFEED_KEY = "body-tracker-refeeds";
+const DIETBREAK_KEY = "body-tracker-diet-break";
+const TRANSITION_KEY = "body-tracker-transition";
 
 // Structural color tokens. Accent colors (phase/macro) are left as literal hex
 // since they read well on both themes.
@@ -460,6 +464,14 @@ export default function App() {
   const [goal, setGoal] = useState(null);
   const [goalOpen, setGoalOpen] = useState(false);
   const [reviewConfirming, setReviewConfirming] = useState(false);
+  // Water logger: { [date]: { plain: number (ml), carbMix: number (ml), gymDay: bool } }
+  const [waterLog, setWaterLog] = useState({});
+  // Refeed days: { [date]: true }
+  const [refeedDays, setRefeedDays] = useState({});
+  // Diet break: { active, startDate, endDate, dismissedAt }
+  const [dietBreak, setDietBreak] = useState(null);
+  // Phase transition: { pending: {phase,magnitude}|null, active, endDate, toPhase, toMagnitude }
+  const [phaseTransition, setPhaseTransition] = useState(null);
   // Phase history: array of { date, phase, magnitude }
   const [phaseHist, setPhaseHist] = useState([]);
   const fileInputRef = useRef(null);
@@ -485,6 +497,14 @@ export default function App() {
       if (ph) setPhaseHist(ph);
       const t = store.get(THEME_KEY);
       if (t === "light" || t === "dark") setTheme(t);
+      const w = store.get(WATER_KEY);
+      if (w) setWaterLog(w);
+      const rf = store.get(REFEED_KEY);
+      if (rf) setRefeedDays(rf);
+      const db = store.get(DIETBREAK_KEY);
+      if (db) setDietBreak(db);
+      const tr = store.get(TRANSITION_KEY);
+      if (tr) setPhaseTransition(tr);
     } catch (_) {}
     setLoaded(true);
   }, []);
@@ -538,27 +558,74 @@ export default function App() {
     setGoal(next);
     store.set(GOAL_KEY, next);
   };
+  const saveWater = (next) => {
+    setWaterLog(next);
+    store.set(WATER_KEY, next);
+  };
+  const saveRefeedDays = (next) => { setRefeedDays(next); store.set(REFEED_KEY, next); };
+  const addRefeedDay = (date) => saveRefeedDays({ ...refeedDays, [date]: true });
+  const removeRefeedDay = (date) => { const n = { ...refeedDays }; delete n[date]; saveRefeedDays(n); };
+  const saveDietBreak = (next) => { setDietBreak(next); store.set(DIETBREAK_KEY, next); };
+  const savePhaseTransition = (next) => { setPhaseTransition(next); store.set(TRANSITION_KEY, next); };
+  const addWater = (date, field, amountMl) => {
+    const day = waterLog[date] || { plain: 0, carbMix: 0, gymDay: false };
+    const next = { ...waterLog, [date]: { ...day, [field]: Math.max(0, (day[field] || 0) + amountMl) } };
+    saveWater(next);
+  };
+  const setGymDay = (date, val) => {
+    const day = waterLog[date] || { plain: 0, carbMix: 0, gymDay: false };
+    saveWater({ ...waterLog, [date]: { ...day, gymDay: val } });
+  };
+  const resetWater = (date) => {
+    const day = waterLog[date] || { plain: 0, carbMix: 0, gymDay: false };
+    saveWater({ ...waterLog, [date]: { plain: 0, carbMix: 0, gymDay: day.gymDay } });
+  };
 
   const savePhaseHist = (next) => {
     setPhaseHist(next);
     store.set(PHASEHIST_KEY, next);
   };
 
-  const setPhaseAndMag = (p, m) => {
+  const applyPhaseAndMag = (p, m) => {
     const changed = p !== phase || m !== magnitude;
     setPhase(p);
     setMagnitude(m);
     persistSettings(p, m);
-    // New phase/intensity → start a fresh review cycle anchored today
     const nt = calcTarget(measuredTDEE ?? calcBaselineTDEE(profile, macroWeight), p, m);
-    if (nt != null) saveCycle({ anchorDate: today, lockedTarget: nt, syncedPhaseDate: today });
-    // Append to phase history (replace same-day record so toggling doesn't spam)
+    if (nt != null) saveCycle({ anchorDate: today, lockedTarget: nt, syncedPhaseDate: latestPhaseChangeDate ?? today });
     if (changed) {
       const w = latestWeight;
       const filtered = phaseHist.filter(h => h.date !== today);
       savePhaseHist([...filtered, { date: today, phase: p, magnitude: m, weightKg: w ?? null }]);
     }
   };
+  const setPhaseAndMag = (p, m) => {
+    // Intercept cut→bulk or bulk→cut transitions for ramp modal
+    const isCrossTransition = (phase === "cut" && p === "bulk") || (phase === "bulk" && p === "cut");
+    if (isCrossTransition && !phaseTransition?.active) {
+      savePhaseTransition({ pending: { phase: p, magnitude: m }, active: false, endDate: null, toPhase: p, toMagnitude: m });
+      return;
+    }
+    applyPhaseAndMag(p, m);
+  };
+  const confirmTransition = (withRamp) => {
+    if (!phaseTransition?.pending && !phaseTransition?.toPhase) return;
+    const toPhase = phaseTransition.toPhase || phaseTransition.pending?.phase;
+    const toMag = phaseTransition.toMagnitude || phaseTransition.pending?.magnitude;
+    if (withRamp) {
+      const endDate = formatDate(new Date(Date.now() + 7 * 86400000));
+      savePhaseTransition({ pending: null, active: true, endDate, toPhase, toMagnitude: toMag });
+    } else {
+      savePhaseTransition(null);
+      applyPhaseAndMag(toPhase, toMag);
+    }
+  };
+  const completeTransition = () => {
+    if (!phaseTransition) return;
+    applyPhaseAndMag(phaseTransition.toPhase, phaseTransition.toMagnitude);
+    savePhaseTransition(null);
+  };
+  const cancelTransition = () => savePhaseTransition(null);
 
   // Save a partial set of fields into the active date (merge, never overwrite siblings)
   // Outlier check: compare a new weight against the most recent prior reading.
@@ -725,7 +792,51 @@ export default function App() {
   // - Review is just a proposal — doesn't affect daily target until Apply is clicked
   // - If no cycle: use formula target
   // The ONLY ways to change target are: (1) change phase/magnitude, or (2) click Apply on review
-  const target = (cycle && cycle.lockedTarget != null) ? cycle.lockedTarget : formulaTarget;
+  const baseTarget = (cycle && cycle.lockedTarget != null) ? cycle.lockedTarget : formulaTarget;
+
+  // Maintenance target for diet breaks, transitions and refeed days
+  const maintenanceTarget = effectiveTDEE ? Math.round(effectiveTDEE / 25) * 25 : baseTarget;
+
+  // Override checks (priority order)
+  const dietBreakActive = dietBreak?.active === true;
+  const transitionActive = phaseTransition?.active === true && phaseTransition.endDate >= today;
+  const refeedToday = refeedDays[today] === true;
+  const targetOverride = dietBreakActive || transitionActive || refeedToday;
+  const target = targetOverride ? maintenanceTarget : baseTarget;
+
+  // Cut start date (for diet break recommendation)
+  const sortedHistAsc = [...phaseHist].sort((a, b) => a.date.localeCompare(b.date));
+  let cutStartDate = null;
+  if (phase === "cut") {
+    let lastNonCut = null;
+    for (const h of sortedHistAsc) { if (h.phase !== "cut" && h.date <= today) lastNonCut = h; }
+    for (const h of sortedHistAsc) {
+      if (h.phase === "cut" && (!lastNonCut || h.date > lastNonCut.date)) { cutStartDate = h.date; break; }
+    }
+  }
+  const weeksCutting = cutStartDate
+    ? Math.floor((new Date(today + "T00:00:00") - new Date(cutStartDate + "T00:00:00")) / (7 * 86400000))
+    : 0;
+  const showDietBreakRec = phase === "cut" && weeksCutting >= 6 && !dietBreak?.active &&
+    (!dietBreak?.dismissedAt || Math.floor((new Date(today + "T00:00:00") - new Date(dietBreak.dismissedAt + "T00:00:00")) / 86400000) > 14);
+
+  // Next refeed recommendation (Saturdays, min 2 days ahead, min 5 days since last)
+  const lastRefeedDate = Object.keys(refeedDays).filter(d => d <= today).sort().pop() || null;
+  const calcNextRefeed = () => {
+    const todayDt = new Date(today + "T00:00:00");
+    const minDt = new Date(todayDt);
+    minDt.setDate(minDt.getDate() + 2);
+    if (lastRefeedDate) {
+      const minFromLast = new Date(lastRefeedDate + "T00:00:00");
+      minFromLast.setDate(minFromLast.getDate() + 5);
+      if (minFromLast > minDt) minDt.setTime(minFromLast.getTime());
+    }
+    const daysToSat = (6 - minDt.getDay() + 7) % 7;
+    const nextSat = new Date(minDt);
+    nextSat.setDate(nextSat.getDate() + daysToSat);
+    return formatDate(nextSat);
+  };
+  const nextRefeedBase = phase === "cut" ? calcNextRefeed() : null;
 
   // Compute the review proposal when due
   let review = null;
@@ -839,9 +950,9 @@ export default function App() {
   };
   const historicalTargetCache = {};
   const targetForDate = (dateStr) => {
-    // Always use the current locked target for vs-target calculations
-    // This ensures log rows are consistent with the daily target display
-    // Historical formula targets are unreliable as TDEE changes over time
+    // Only show vs-target for dates within the current cycle anchor
+    // Dates before the anchor were under a different target — show nothing
+    if (!cycle?.anchorDate || dateStr < cycle.anchorDate) return null;
     return target;
   };
 
@@ -872,11 +983,12 @@ export default function App() {
     const bfReg = bfPts.length >= 2 ? linReg(bfPts) : null;
     const weightChange = wReg ? wReg.slope * (wPts[wPts.length - 1].x - wPts[0].x) / 86400000 : null;
     const weightChangePerWeek = wReg ? wReg.slope * 7 * 86400000 : null;
-    const bfChange = bfReg ? bfReg.slope * (bfPts[bfPts.length - 1].x - bfPts[0].x) / 86400000 : null;
     const startWeight = wRows.length ? wRows[0].weight : null;
     const endWeight = wRows.length ? wRows[wRows.length - 1].weight : null;
     const startBf = bfRows.length ? bfRows[0].bf : null;
     const endBf = bfRows.length ? bfRows[bfRows.length - 1].bf : null;
+    // Simple start-to-end delta — regression slope gave near-zero on noisy data
+    const bfChange = (startBf != null && endBf != null) ? endBf - startBf : null;
 
     // Adherence to historical target within range
     let onTargetDays = 0, overDays = 0, underDays = 0, targetComparable = 0;
@@ -1016,6 +1128,14 @@ export default function App() {
   })();
 
   const reportData = buildReport(reportStart, reportEnd);
+  // Comparison: this month vs last month
+  const compToday = new Date();
+  const compThisStart = new Date(compToday.getFullYear(), compToday.getMonth(), 1);
+  const compLastStart = new Date(compToday.getFullYear(), compToday.getMonth() - 1, 1);
+  const compLastEnd = new Date(compToday.getFullYear(), compToday.getMonth(), 0);
+  const compThisData = buildReport(formatDate(compThisStart), formatDate(compToday));
+  const compLastData = buildReport(formatDate(compLastStart), formatDate(compLastEnd));
+
 
   // Auto-start a cycle once we have a real target and none is running
   useEffect(() => {
@@ -1510,6 +1630,30 @@ export default function App() {
         />
       )}
 
+      {/* Phase Transition Modal */}
+      {phaseTransition?.pending && (
+        <PhaseTransitionModal
+          phaseTransition={phaseTransition}
+          onConfirm={confirmTransition}
+          onCancel={cancelTransition}
+        />
+      )}
+      {/* Transition complete prompt */}
+      {phaseTransition?.active && phaseTransition.endDate < today && (
+        <div style={{ position: "fixed", bottom: 24, left: 16, right: 16, zIndex: 200, background: "#6366f1", color: "#fff", borderRadius: 12, padding: "14px 16px", boxShadow: "0 8px 32px #0004" }}>
+          <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 6 }}>✅ Transition complete</div>
+          <div style={{ fontSize: 11, marginBottom: 10, opacity: 0.85 }}>Your 1-week maintenance period is done. Ready to switch to {phaseTransition.toPhase}?</div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={completeTransition} style={{ flex: 1, background: "#fff", color: "#6366f1", border: "none", borderRadius: 6, padding: "8px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+              Switch to {phaseTransition.toPhase} now
+            </button>
+            <button onClick={cancelTransition} style={{ background: "transparent", color: "#fff", border: "1px solid #ffffff60", borderRadius: 6, padding: "8px 12px", fontSize: 11, cursor: "pointer" }}>
+              Later
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Goal modal */}
       {goalOpen && (
         <GoalModal
@@ -1609,6 +1753,8 @@ export default function App() {
             onExportMD={() => exportReportMD(reportData)}
             onCopyMD={() => copyReportMD(reportData)}
             onExportPDF={() => exportReportPDF(reportData)}
+            compThisData={compThisData}
+            compLastData={compLastData}
           />
         )}
         {view === "log" && (
@@ -1634,6 +1780,53 @@ export default function App() {
               style={{ background: "transparent", border: "1px solid #fbbf24", color: "#fbbf24", borderRadius: 6, padding: "5px 12px", fontSize: 11, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}>
               Log it now
             </button>
+          </div>
+        )}
+
+        {/* ── Quick Log Widget (today only) ── */}
+        {isToday && (
+          <div style={{ marginTop: 20, marginBottom: 0 }}>
+            <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--text-muted)", marginBottom: 8 }}>Quick Log</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              {/* Morning quick log */}
+              <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10, padding: "12px" }}>
+                <div style={{ fontSize: 9, color: "var(--text-muted)", fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 8 }}>
+                  🌅 Morning{morningLogged ? <span style={{ color: "#34d399", marginLeft: 4 }}>✓</span> : null}
+                </div>
+                <input type="number" inputMode="decimal" value={morningForm.weight}
+                  onChange={e => setMorningForm(f => ({ ...f, weight: e.target.value }))}
+                  placeholder={activeEntry.weight != null ? String(activeEntry.weight) : "kg"}
+                  style={{ width: "100%", boxSizing: "border-box", background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 6, padding: "6px 8px", fontSize: 12, color: "var(--text)", marginBottom: 6, outline: "none" }} />
+                <input type="number" inputMode="decimal" value={morningForm.bf}
+                  onChange={e => setMorningForm(f => ({ ...f, bf: e.target.value }))}
+                  placeholder={activeEntry.bf != null ? String(activeEntry.bf) : "BF%"}
+                  style={{ width: "100%", boxSizing: "border-box", background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 6, padding: "6px 8px", fontSize: 12, color: "var(--text)", marginBottom: 8, outline: "none" }} />
+                <button onClick={handleSaveMorning}
+                  disabled={morningForm.weight === "" && morningForm.bf === ""}
+                  style={{ width: "100%", background: (morningForm.weight === "" && morningForm.bf === "") ? "var(--border)" : "#8b5cf6", color: (morningForm.weight === "" && morningForm.bf === "") ? "var(--text-dim)" : "#fff", border: "none", borderRadius: 6, padding: "7px", fontSize: 11, fontWeight: 700, cursor: (morningForm.weight === "" && morningForm.bf === "") ? "default" : "pointer" }}>
+                  Save
+                </button>
+              </div>
+              {/* Evening quick log */}
+              <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10, padding: "12px" }}>
+                <div style={{ fontSize: 9, color: "var(--text-muted)", fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 8 }}>
+                  🌙 Evening{eveningLogged ? <span style={{ color: "#34d399", marginLeft: 4 }}>✓</span> : null}
+                </div>
+                <input type="number" inputMode="decimal" value={eveningForm.calories}
+                  onChange={e => setEveningForm(f => ({ ...f, calories: e.target.value }))}
+                  placeholder={activeEntry.calories != null ? String(activeEntry.calories) : "kcal"}
+                  style={{ width: "100%", boxSizing: "border-box", background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 6, padding: "6px 8px", fontSize: 12, color: "var(--text)", marginBottom: 6, outline: "none" }} />
+                <input type="number" inputMode="decimal" value={eveningForm.protein}
+                  onChange={e => setEveningForm(f => ({ ...f, protein: e.target.value }))}
+                  placeholder={activeEntry.protein != null ? String(activeEntry.protein) : "protein g"}
+                  style={{ width: "100%", boxSizing: "border-box", background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 6, padding: "6px 8px", fontSize: 12, color: "var(--text)", marginBottom: 8, outline: "none" }} />
+                <button onClick={handleSaveEvening}
+                  disabled={eveningForm.calories === "" && eveningForm.protein === ""}
+                  style={{ width: "100%", background: (eveningForm.calories === "" && eveningForm.protein === "") ? "var(--border)" : "#6366f1", color: (eveningForm.calories === "" && eveningForm.protein === "") ? "var(--text-dim)" : "#fff", border: "none", borderRadius: 6, padding: "7px", fontSize: 11, fontWeight: 700, cursor: (eveningForm.calories === "" && eveningForm.protein === "") ? "default" : "pointer" }}>
+                  Save
+                </button>
+              </div>
+            </div>
           </div>
         )}
 
@@ -2093,6 +2286,63 @@ export default function App() {
         </div>
 
 
+        {/* ── Diet Break Banner ── */}
+        <DietBreakBanner
+          dietBreak={dietBreak}
+          weeksCutting={weeksCutting}
+          showRec={showDietBreakRec}
+          maintenanceTarget={maintenanceTarget}
+          today={today}
+          onAgree={() => saveDietBreak({ active: true, startDate: today, endDate: formatDate(new Date(Date.now() + 14 * 86400000)), dismissedAt: null })}
+          onDecline={() => saveDietBreak({ ...(dietBreak || {}), active: false, dismissedAt: today })}
+          onEnd={() => saveDietBreak({ ...(dietBreak || {}), active: false, dismissedAt: null })}
+        />
+
+        {/* ── Refeed Recommendation ── */}
+        <RefeedRecommendation
+          phase={phase}
+          today={today}
+          nextRefeedBase={nextRefeedBase}
+          refeedDays={refeedDays}
+          maintenanceTarget={maintenanceTarget}
+          onSchedule={addRefeedDay}
+          onRemove={removeRefeedDay}
+        />
+
+        {/* ── Transition Status Banner ── */}
+        {phaseTransition?.active && phaseTransition.endDate >= today && (
+          <div style={{ marginTop: 14, background: "#6366f115", border: "1px solid #6366f130", borderRadius: 10, padding: "14px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+              <span style={{ fontSize: 11, fontWeight: 700, color: "#a5b4fc" }}>🔄 Transition to {phaseTransition.toPhase} — maintenance week</span>
+            </div>
+            <div style={{ fontSize: 10.5, color: "var(--text-soft)", lineHeight: 1.5, marginBottom: 8 }}>
+              Target is set to maintenance ({maintenanceTarget?.toLocaleString()} kcal) until {new Date(phaseTransition.endDate + "T00:00:00").toLocaleDateString("en-IE", { weekday: "short", day: "numeric", month: "short" })}. Keep training, let your metabolism stabilise.
+            </div>
+            <button onClick={cancelTransition} style={{ background: "transparent", color: "var(--text-faint)", border: "none", fontSize: 10, cursor: "pointer", textDecoration: "underline" }}>
+              Cancel transition
+            </button>
+          </div>
+        )}
+
+        {/* ── Water Logger ── */}}
+        <WaterLogger
+          date={today}
+          waterLog={waterLog}
+          latestWeight={latestWeight}
+          addWater={addWater}
+          setGymDay={setGymDay}
+          resetWater={resetWater}
+        />
+
+        {/* ── Mini Phase Planner ── */}
+        <MiniPhasePlanner
+          currentBf={avgBf}
+          currentWeight={latestWeight}
+          phase={phase}
+          magnitude={magnitude}
+          actualRatePerWeek={weeklyChange}
+        />
+
         {/* ── Log Table ── */}
         {displayRows.length > 0 && (
           <div>
@@ -2166,6 +2416,379 @@ export default function App() {
           </div>
         )}
         </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Phase Transition Modal ──
+function PhaseTransitionModal({ phaseTransition, onConfirm, onCancel }) {
+  if (!phaseTransition?.pending && !phaseTransition?.toPhase) return null;
+  const from = phaseTransition.pending ? (phaseTransition.toPhase === "bulk" ? "cut" : "bulk") : "";
+  const to = phaseTransition.toPhase || phaseTransition.pending?.phase;
+  const fromColor = from === "cut" ? "#f87171" : "#60a5fa";
+  const toColor = to === "bulk" ? "#60a5fa" : "#f87171";
+  return (
+    <div onClick={onCancel} style={{ position: "fixed", inset: 0, zIndex: 300, background: "var(--overlay)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
+      <div onClick={e => e.stopPropagation()} style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: "22px", width: "100%", maxWidth: 360, boxShadow: "0 20px 60px var(--overlay)" }}>
+        <div style={{ fontSize: 13, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: "var(--text)", marginBottom: 14 }}>Phase Switch</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
+          <span style={{ fontWeight: 700, color: fromColor, fontSize: 13, textTransform: "capitalize" }}>{from}</span>
+          <span style={{ color: "var(--text-muted)", fontSize: 16 }}>→</span>
+          <span style={{ fontWeight: 700, color: toColor, fontSize: 13, textTransform: "capitalize" }}>{to}</span>
+        </div>
+        <div style={{ background: "var(--bg)", borderRadius: 8, padding: "12px", marginBottom: 16 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text)", marginBottom: 6 }}>🔄 1-week transition recommended</div>
+          <div style={{ fontSize: 10.5, color: "var(--text-soft)", lineHeight: 1.55 }}>
+            A week at maintenance before switching lets hormones and metabolism stabilise — reducing fat spillover on the bulk or aggressive LBM loss on the cut. Your target will be set to maintenance for 7 days, then you'll be prompted to switch.
+          </div>
+        </div>
+        <button onClick={() => onConfirm(true)} style={{ width: "100%", background: "#6366f1", color: "#fff", border: "none", borderRadius: 8, padding: "11px", fontSize: 12, fontWeight: 700, cursor: "pointer", marginBottom: 8, letterSpacing: "0.04em", textTransform: "uppercase" }}>
+          Start 1-week transition
+        </button>
+        <button onClick={() => onConfirm(false)} style={{ width: "100%", background: "transparent", color: "var(--text-muted)", border: "1px solid var(--border)", borderRadius: 8, padding: "9px", fontSize: 12, fontWeight: 600, cursor: "pointer", marginBottom: 8 }}>
+          Skip — switch to {to} now
+        </button>
+        <button onClick={onCancel} style={{ width: "100%", background: "transparent", color: "var(--text-faint)", border: "none", padding: "6px", fontSize: 11, cursor: "pointer" }}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Diet Break Banner ──
+function DietBreakBanner({ dietBreak, weeksCutting, showRec, maintenanceTarget, today, onAgree, onDecline, onEnd }) {
+  if (dietBreak?.active) {
+    const start = dietBreak.startDate;
+    const dayIn = start ? Math.floor((new Date(today + "T00:00:00") - new Date(start + "T00:00:00")) / 86400000) + 1 : 1;
+    const totalDays = 14;
+    const pct = Math.min(100, Math.round((dayIn / totalDays) * 100));
+    return (
+      <div style={{ marginTop: 14, background: "#34d39915", border: "1px solid #34d39940", borderRadius: 10, padding: "14px" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+          <span style={{ fontSize: 11, fontWeight: 700, color: "#34d399" }}>🌿 Diet break active — Day {dayIn} of {totalDays}</span>
+          <span style={{ fontSize: 10, color: "var(--text-muted)" }}>{maintenanceTarget?.toLocaleString()} kcal target</span>
+        </div>
+        <div style={{ height: 6, borderRadius: 999, background: "var(--bg)", overflow: "hidden", marginBottom: 10 }}>
+          <div style={{ height: "100%", width: `${pct}%`, background: "#34d399", borderRadius: 999, transition: "width 400ms" }} />
+        </div>
+        <div style={{ fontSize: 10, color: "var(--text-soft)", lineHeight: 1.5, marginBottom: 10 }}>
+          Eat at maintenance, keep training but reduce intensity. Hormones (leptin, T3) normalise over 1–2 weeks, making the next cut phase more effective.
+        </div>
+        <button onClick={onEnd} style={{ background: "transparent", color: "var(--text-muted)", border: "1px solid var(--border)", borderRadius: 6, padding: "6px 14px", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
+          End diet break
+        </button>
+      </div>
+    );
+  }
+  if (!showRec) return null;
+  return (
+    <div style={{ marginTop: 14, background: "#fbbf2415", border: "1px solid #fbbf2440", borderRadius: 10, padding: "14px" }}>
+      <div style={{ fontSize: 11, fontWeight: 700, color: "#fbbf24", marginBottom: 6 }}>⚠️ Diet break recommended</div>
+      <div style={{ fontSize: 10.5, color: "var(--text-soft)", lineHeight: 1.55, marginBottom: 10 }}>
+        You've been cutting for <strong style={{ color: "var(--text)" }}>{weeksCutting} weeks</strong>. Evidence (Byrne et al. 2017 — MATADOR study) suggests a 1–2 week diet break at maintenance every 6–8 weeks produces significantly better fat loss outcomes than continuous restriction, by preventing adaptive thermogenesis.
+      </div>
+      <div style={{ display: "flex", gap: 8 }}>
+        <button onClick={onAgree} style={{ background: "#fbbf24", color: "var(--surface)", border: "none", borderRadius: 6, padding: "7px 16px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+          Start diet break
+        </button>
+        <button onClick={onDecline} style={{ background: "transparent", color: "var(--text-muted)", border: "1px solid var(--border)", borderRadius: 6, padding: "7px 14px", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
+          Not yet
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Refeed Recommendation ──
+function RefeedRecommendation({ phase, today, nextRefeedBase, refeedDays, maintenanceTarget, onSchedule, onRemove }) {
+  const [offset, setOffset] = React.useState(0);
+  if (phase !== "cut") return null;
+  const isRefeedToday = refeedDays[today] === true;
+  // Find upcoming scheduled refeeds
+  const upcomingRefeeds = Object.keys(refeedDays).filter(d => d > today).sort();
+
+  // Helper to add days
+  const addDays = (dateStr, n) => {
+    const d = new Date(dateStr + "T00:00:00");
+    d.setDate(d.getDate() + n);
+    return formatDate(d);
+  };
+  const fmtDate = (dateStr) => new Date(dateStr + "T00:00:00").toLocaleDateString("en-IE", { weekday: "short", day: "numeric", month: "short" });
+  const proposedDate = nextRefeedBase ? addDays(nextRefeedBase, offset) : null;
+
+  if (isRefeedToday) {
+    return (
+      <div style={{ marginTop: 14, background: "#60a5fa15", border: "1px solid #60a5fa40", borderRadius: 10, padding: "14px" }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: "#60a5fa", marginBottom: 6 }}>🔵 Refeed day — target set to maintenance</div>
+        <div style={{ fontSize: 10.5, color: "var(--text-soft)", lineHeight: 1.5, marginBottom: 8 }}>
+          Today is a refeed day. Aim for {maintenanceTarget?.toLocaleString()} kcal — prioritise carbohydrates. This replenishes glycogen, temporarily restores leptin and improves performance on the days following.
+        </div>
+        <button onClick={() => onRemove(today)} style={{ background: "transparent", color: "var(--text-faint)", border: "none", fontSize: 10, cursor: "pointer", textDecoration: "underline" }}>
+          Remove refeed day
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ marginTop: 14 }}>
+      {upcomingRefeeds.length > 0 && (
+        <div style={{ background: "#60a5fa10", border: "1px solid #60a5fa30", borderRadius: 10, padding: "12px", marginBottom: 8 }}>
+          <div style={{ fontSize: 10, fontWeight: 700, color: "#60a5fa", marginBottom: 4 }}>📅 Scheduled refeed{upcomingRefeeds.length > 1 ? "s" : ""}</div>
+          {upcomingRefeeds.map(d => (
+            <div key={d} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 4 }}>
+              <span style={{ fontSize: 11, color: "var(--text-soft)" }}>{fmtDate(d)}</span>
+              <button onClick={() => onRemove(d)} style={{ background: "none", border: "none", color: "var(--text-faint)", fontSize: 10, cursor: "pointer", textDecoration: "underline" }}>Remove</button>
+            </div>
+          ))}
+        </div>
+      )}
+      {proposedDate && upcomingRefeeds.length === 0 && (
+        <div style={{ background: "#6366f115", border: "1px solid #6366f130", borderRadius: 10, padding: "14px" }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: "#a5b4fc", marginBottom: 6 }}>📅 Refeed forecast</div>
+          <div style={{ fontSize: 10.5, color: "var(--text-soft)", lineHeight: 1.5, marginBottom: 10 }}>
+            Based on your last refeed, the next is recommended around <strong style={{ color: "var(--text)" }}>{fmtDate(proposedDate)}</strong>. Refeeds every 7–10 days during a cut help maintain leptin levels and training performance (Helms 2014).
+          </div>
+          <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
+            {[-1, 0, 1].map(o => {
+              const d = addDays(nextRefeedBase, o);
+              const label = new Date(d + "T00:00:00").toLocaleDateString("en-IE", { weekday: "short", day: "numeric" });
+              return (
+                <button key={o} onClick={() => setOffset(o)}
+                  style={{ flex: 1, padding: "7px 4px", fontSize: 10, fontWeight: 600, cursor: "pointer", borderRadius: 6,
+                    background: offset === o ? "#6366f1" : "var(--bg)",
+                    color: offset === o ? "#fff" : "var(--text-soft)",
+                    border: `1px solid ${offset === o ? "#6366f1" : "var(--border)"}` }}>
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+          <button onClick={() => { onSchedule(proposedDate); setOffset(0); }}
+            style={{ width: "100%", background: "#6366f1", color: "#fff", border: "none", borderRadius: 6, padding: "9px", fontSize: 11, fontWeight: 700, cursor: "pointer", letterSpacing: "0.04em", textTransform: "uppercase" }}>
+            Schedule refeed
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Water Logger Component ──
+function WaterLogger({ date, waterLog, latestWeight, addWater, setGymDay, resetWater }) {
+  const [customMl, setCustomMl] = useState("");
+  const [customMlCarb, setCustomMlCarb] = useState("");
+  const day = waterLog[date] || { plain: 0, carbMix: 0, gymDay: false };
+  const baseGoal = latestWeight ? Math.round(latestWeight * 35 / 100) * 100 : 2500;
+  const gymBonus = day.gymDay ? 750 : 0;
+  const goal = baseGoal + gymBonus;
+  const totalHydration = (day.plain || 0) + (day.carbMix || 0);
+  const pct = Math.min(100, Math.round((totalHydration / goal) * 100));
+  const gaugeColor = pct >= 100 ? "#34d399" : pct >= 66 ? "#60a5fa" : pct >= 33 ? "#818cf8" : "var(--border-strong)";
+  const presets = [150, 250, 330, 500, 750];
+  const card = { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10, padding: "14px 14px 12px" };
+  const btn = { border: "1px solid var(--border)", borderRadius: 6, padding: "5px 10px", fontSize: 11, fontWeight: 600, cursor: "pointer", background: "var(--bg)", color: "var(--text-soft)" };
+  return (
+    <div style={{ marginTop: 24 }}>
+      <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--text-muted)", marginBottom: 10 }}>Hydration</div>
+      <div style={card}>
+        {/* Gym day toggle + goal */}
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+          <div style={{ fontSize: 11, color: "var(--text-soft)" }}>
+            Goal: <strong style={{ color: "var(--text)" }}>{(goal / 1000).toFixed(1)}L</strong>
+            <span style={{ color: "var(--text-dim)", marginLeft: 4 }}>({(baseGoal/1000).toFixed(1)}L base{day.gymDay ? " +0.75L gym" : ""})</span>
+          </div>
+          <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 11, color: "var(--text-soft)" }}>
+            <input type="checkbox" checked={day.gymDay} onChange={e => setGymDay(date, e.target.checked)}
+              style={{ accentColor: "#6366f1", width: 14, height: 14 }} />
+            Gym day
+          </label>
+        </div>
+        {/* Gauge */}
+        <div style={{ marginBottom: 10 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+            <span style={{ fontSize: 20, fontWeight: 800, color: pct >= 100 ? "#34d399" : "var(--text)" }}>
+              {(totalHydration / 1000).toFixed(2)}L
+            </span>
+            <span style={{ fontSize: 11, color: "var(--text-muted)", alignSelf: "flex-end", marginBottom: 3 }}>{pct}% of goal</span>
+          </div>
+          <div style={{ height: 10, borderRadius: 999, background: "var(--bg)", overflow: "hidden", border: "1px solid var(--border)" }}>
+            <div style={{ height: "100%", width: `${pct}%`, background: gaugeColor, borderRadius: 999, transition: "width 400ms ease, background 400ms ease" }} />
+          </div>
+          {pct >= 100 && <div style={{ fontSize: 10, color: "#34d399", marginTop: 4, textAlign: "center" }}>✓ Goal reached</div>}
+          {totalHydration > 0 && (
+            <div style={{ display: "flex", gap: 12, marginTop: 8 }}>
+              <span style={{ fontSize: 10, color: "var(--text-muted)" }}>
+                💧 Water: <strong style={{ color: "var(--text)" }}>{(( day.plain || 0) / 1000).toFixed(2)}L</strong>
+              </span>
+              {day.carbMix > 0 && (
+                <span style={{ fontSize: 10, color: "var(--text-muted)" }}>
+                  🟡 Carb mix: <strong style={{ color: "#f59e0b" }}>{((day.carbMix || 0) / 1000).toFixed(2)}L</strong>
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+        {/* Quick add water buttons */}
+        <div style={{ fontSize: 9, color: "var(--text-muted)", fontWeight: 600, letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 6 }}>Add water</div>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
+          {presets.map(ml => (
+            <button key={ml} onClick={() => addWater(date, "plain", ml)} style={btn}>{ml}ml</button>
+          ))}
+        </div>
+        <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
+          <input type="number" inputMode="decimal" value={customMl} onChange={e => setCustomMl(e.target.value)}
+            placeholder="Custom ml" style={{ flex: 1, background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 6, padding: "6px 10px", fontSize: 12, color: "var(--text)", outline: "none" }} />
+          <button onClick={() => { if (customMl !== "") { addWater(date, "plain", Number(customMl)); setCustomMl(""); } }}
+            style={{ ...btn, background: "#6366f1", color: "#fff", border: "none", padding: "6px 14px" }}>Add</button>
+        </div>
+        {/* Carb mix section */}
+        <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12 }}>
+          <div style={{ fontSize: 9, color: "var(--text-muted)", fontWeight: 600, letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 6 }}>
+            Carb mix (maltodextrin + water) <span style={{ color: "var(--text-faint)", fontWeight: 400 }}>counts toward hydration — mix at 6–8% (50g per 625–750ml)</span>
+          </div>
+          <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+            <input type="number" inputMode="decimal" value={customMlCarb} onChange={e => setCustomMlCarb(e.target.value)}
+              placeholder="ml" style={{ flex: 1, background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 6, padding: "6px 10px", fontSize: 12, color: "var(--text)", outline: "none" }} />
+            <button onClick={() => { if (customMlCarb !== "") { addWater(date, "carbMix", Number(customMlCarb)); setCustomMlCarb(""); } }}
+              style={{ ...btn, background: "#f59e0b", color: "#fff", border: "none", padding: "6px 14px" }}>Log</button>
+          </div>
+
+        </div>
+        {/* Reset */}
+        {totalHydration > 0 && (
+          <button onClick={() => resetWater(date)} style={{ marginTop: 12, background: "none", border: "none", color: "var(--text-faint)", fontSize: 10, cursor: "pointer", textDecoration: "underline" }}>
+            Reset today
+          </button>
+        )}
+      </div>
+    </div>
+  </div>
+  );
+}
+
+// ── Mini Phase Planner Component ──
+function MiniPhasePlanner({ currentBf, currentWeight, phase, magnitude, actualRatePerWeek }) {
+  const BF_BULK_CEILING = 17;  // switch to cut above this
+  const BF_CUT_FLOOR = 12;     // switch to bulk below this
+  const BF_RECOMP_LOW = 13;
+  const BF_RECOMP_HIGH = 17;
+
+  if (currentBf == null || currentWeight == null) {
+    return (
+      <div style={{ marginTop: 24, background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10, padding: "16px" }}>
+        <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--text-muted)", marginBottom: 8 }}>Phase Planner</div>
+        <div style={{ fontSize: 12, color: "var(--text-muted)" }}>Log weight and body fat to see your phase plan.</div>
+      </div>
+    );
+  }
+
+  const rate = actualRatePerWeek; // kg/wk (negative = losing)
+  const ratePerWeekBf = rate != null ? (rate / currentWeight) * 100 : null; // % BW/wk
+
+  // Estimate BF% change per week based on phase
+  // Fat mass change ≈ weight change × (1 - lean fraction preserved)
+  // Simplified: assume ~75% of cut loss is fat, ~30% of bulk gain is fat
+  const fatChangePctPerWeek = rate != null
+    ? phase === "cut"
+      ? (rate * 0.75 / currentWeight) * 100   // negative, losing fat
+      : (rate * 0.30 / currentWeight) * 100    // positive, gaining fat
+    : null;
+
+  // Weeks until phase switch threshold
+  let weeksUntilSwitch = null;
+  let switchTarget = null;
+  let switchPhase = null;
+
+  if (fatChangePctPerWeek != null && Math.abs(fatChangePctPerWeek) > 0.01) {
+    if (phase === "cut") {
+      const bfToLose = currentBf - BF_CUT_FLOOR;
+      weeksUntilSwitch = bfToLose > 0 ? Math.ceil(bfToLose / Math.abs(fatChangePctPerWeek)) : 0;
+      switchTarget = BF_CUT_FLOOR;
+      switchPhase = "bulk";
+    } else if (phase === "bulk") {
+      const bfToGain = BF_BULK_CEILING - currentBf;
+      weeksUntilSwitch = bfToGain > 0 ? Math.ceil(bfToGain / Math.abs(fatChangePctPerWeek)) : 0;
+      switchTarget = BF_BULK_CEILING;
+      switchPhase = "cut";
+    }
+  }
+
+  // Project full cycle: current → switch → back
+  const weeksInCurrent = weeksUntilSwitch;
+  const weightAtSwitch = weeksInCurrent != null && rate != null ? currentWeight + (rate * weeksInCurrent) : null;
+
+  // Next phase estimate (reverse direction)
+  let weeksInNext = null;
+  let bfAfterCycle = null;
+  if (phase === "cut" && weightAtSwitch != null) {
+    const conservativeBulkRate = weightAtSwitch * 0.002; // ~0.2% BW/wk lean bulk
+    const bulkFatPctPerWeek = (conservativeBulkRate * 0.30 / weightAtSwitch) * 100;
+    const bfToGain = BF_BULK_CEILING - switchTarget;
+    weeksInNext = bfToGain > 0 && bulkFatPctPerWeek > 0 ? Math.ceil(bfToGain / bulkFatPctPerWeek) : null;
+    bfAfterCycle = BF_BULK_CEILING;
+  } else if (phase === "bulk" && weightAtSwitch != null) {
+    const moderateCutRate = -(weightAtSwitch * 0.006); // ~0.6% BW/wk cut
+    const cutFatPctPerWeek = Math.abs(moderateCutRate * 0.75 / weightAtSwitch) * 100;
+    const bfToLose = switchTarget - BF_CUT_FLOOR;
+    weeksInNext = bfToLose > 0 && cutFatPctPerWeek > 0 ? Math.ceil(bfToLose / cutFatPctPerWeek) : null;
+    bfAfterCycle = BF_CUT_FLOOR;
+  }
+
+  const totalCycleWeeks = weeksInCurrent != null && weeksInNext != null ? weeksInCurrent + weeksInNext : null;
+
+  const phaseColor = { cut: "#f87171", bulk: "#60a5fa", maintain: "#34d399" };
+  const card = { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10, padding: "16px" };
+  const row = (label, value, color) => (
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: "1px solid var(--border)" }}>
+      <span style={{ fontSize: 11, color: "var(--text-soft)" }}>{label}</span>
+      <span style={{ fontSize: 12, fontWeight: 700, color: color || "var(--text)" }}>{value}</span>
+    </div>
+  );
+
+  return (
+    <div style={{ marginTop: 24 }}>
+      <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--text-muted)", marginBottom: 10 }}>Phase Planner</div>
+      <div style={card}>
+        {/* Current phase summary */}
+        <div style={{ fontSize: 11, fontWeight: 700, color: phaseColor[phase] || "var(--text)", marginBottom: 10, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+          Current: {phase} · {currentBf.toFixed(1)}% BF · {currentWeight.toFixed(1)} kg
+        </div>
+        {rate == null ? (
+          <div style={{ fontSize: 11, color: "var(--text-muted)" }}>Log more data to see rate of change projections.</div>
+        ) : (
+          <>
+            {row("Current rate", `${rate >= 0 ? "+" : ""}${rate.toFixed(2)} kg/wk`, rate < 0 ? "#f87171" : "#60a5fa")}
+            {weeksUntilSwitch != null && row(
+              `Weeks until ${switchPhase === "bulk" ? "bulking BF floor" : "cutting BF ceiling"}`,
+              weeksUntilSwitch > 0 ? `~${weeksUntilSwitch} wks (${switchTarget}% BF)` : "Switch now",
+              weeksUntilSwitch <= 2 ? "#fbbf24" : "#34d399"
+            )}
+            {weightAtSwitch != null && row("Est. weight at switch", `${weightAtSwitch.toFixed(1)} kg`, "var(--text)")}
+
+            {/* Full cycle plan */}
+            {totalCycleWeeks != null && (
+              <div style={{ marginTop: 14, background: "var(--bg)", borderRadius: 8, padding: "12px" }}>
+                <div style={{ fontSize: 10, fontWeight: 700, color: "var(--text-muted)", letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 8 }}>Full Cycle Plan</div>
+                <div style={{ display: "flex", gap: 0, borderRadius: 6, overflow: "hidden", marginBottom: 10, height: 24 }}>
+                  <div style={{ flex: weeksInCurrent, background: phaseColor[phase], display: "flex", alignItems: "center", justifyContent: "center" }}>
+                    <span style={{ fontSize: 9, fontWeight: 700, color: "#fff" }}>{phase} {weeksInCurrent}w</span>
+                  </div>
+                  <div style={{ flex: weeksInNext, background: phaseColor[switchPhase] || "#34d399", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                    <span style={{ fontSize: 9, fontWeight: 700, color: "#fff" }}>{switchPhase} {weeksInNext}w</span>
+                  </div>
+                </div>
+                {row("Total cycle length", `~${totalCycleWeeks} weeks`, "var(--text)")}
+                {row("BF% at cycle end", `~${bfAfterCycle}%`, "var(--text)")}
+                <div style={{ fontSize: 9.5, color: "var(--text-muted)", marginTop: 8, lineHeight: 1.5 }}>
+                  Projections assume current rate holds for {phase === "cut" ? "cut" : "bulk"}, then a {phase === "cut" ? "conservative lean bulk" : "moderate cut"} for the next phase. Actual timeline varies with adherence, TDEE changes, and training. Review every 2 weeks.
+                </div>
+              </div>
+            )}
+          </>
         )}
       </div>
     </div>
@@ -2410,8 +3033,15 @@ function MacrosView({ macros, target, tdee, phase, phaseInfo, magInfo, magnitude
   const belowBMR = bmr != null && activeCals < bmr;
   let riskLevel = "none"; // "none" | "caution" | "high"
   if (deficit > 0) {
+    // Cut-side warnings
     if (pctBWperWk > 1.5 || belowBMR || (overCeiling != null && overCeiling > 150)) riskLevel = "high";
     else if (pctBWperWk > 1.0 || deficitPctTDEE > 25 || (overCeiling != null && overCeiling > 0)) riskLevel = "caution";
+  } else if (phase === "bulk") {
+    // Bulk-side warnings: flag when rate exceeds upper bound of selected magnitude
+    const bulkCeilings = { conservative: 0.25, moderate: 0.5, aggressive: 1.0 };
+    const bulkCeiling = bulkCeilings[magnitude] ?? 0.5;
+    if (pctBWperWk > bulkCeiling * 2) riskLevel = "high";
+    else if (pctBWperWk > bulkCeiling) riskLevel = "caution";
   }
   const riskColor = riskLevel === "high" ? "#f87171" : "#fbbf24";
 
@@ -2467,28 +3097,48 @@ function MacrosView({ macros, target, tdee, phase, phaseInfo, magInfo, magnitude
             <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
               <span style={{ fontSize: 12 }}>{riskLevel === "high" ? "🛑" : "⚠️"}</span>
               <span style={{ fontSize: 11, fontWeight: 700, color: riskColor, letterSpacing: "0.02em" }}>
-                {riskLevel === "high" ? "Aggressive deficit — lean-mass loss likely" : "Steep deficit — watch lean mass & adherence"}
+                {phase === "bulk"
+                  ? (riskLevel === "high" ? "Excessive surplus — mostly fat gain from here" : "Above recommended range — fat gain accelerating")
+                  : (riskLevel === "high" ? "Aggressive deficit — lean-mass loss likely" : "Steep deficit — watch lean mass & adherence")}
               </span>
             </div>
             <div style={{ fontSize: 10.5, color: "var(--text-soft)", lineHeight: 1.55 }}>
-              At {activeCals.toLocaleString()} kcal you're ~{deficit.toLocaleString()} kcal/day under TDEE
-              {" "}({pctBWperWk.toFixed(1)}% BW/wk · {deficitPctTDEE.toFixed(0)}% of TDEE).
-              {fatCeiling != null && (
-                overCeiling > 0
-                  ? ` Your fat stores can supply only ~${fatCeiling.toLocaleString()} kcal/day (≈${fatMassKg.toFixed(1)} kg fat mass × ~31 kcal/lb, Alpert 2005); the ~${overCeiling.toLocaleString()} kcal/day beyond that is drawn largely from lean tissue — on the order of ~${leanLoss14.toFixed(1)} kg of lean mass over 14 days if held (rough estimate; real partitioning varies with leanness, protein and training).`
-                  : ` This still sits within what your fat stores can supply (~${fatCeiling.toLocaleString()} kcal/day from ≈${fatMassKg.toFixed(1)} kg fat mass), so most loss should be fat — provided protein and training stay high.`
+              {phase === "bulk" ? (
+                <>
+                  At {activeCals.toLocaleString()} kcal you're +{Math.abs(deficit).toLocaleString()} kcal/day above TDEE ({pctBWperWk.toFixed(1)}% BW/wk).
+                  {" "}The upper bound for {magInfo?.label ?? magnitude} bulk is ~{(phase === "bulk" ? ({ conservative: 0.25, moderate: 0.5, aggressive: 1.0 }[magnitude] ?? 0.5) : 0).toFixed(2)}% BW/wk.
+                  {" "}Above this, a greater proportion of gain is fat rather than muscle (Slater & Phillips 2011; Helms 2014).
+                  {riskLevel === "high" && " At this rate the surplus substantially exceeds what muscle tissue can absorb — reduce intake to stay within your chosen magnitude."}
+                </>
+              ) : (
+                <>
+                  At {activeCals.toLocaleString()} kcal you're ~{deficit.toLocaleString()} kcal/day under TDEE
+                  {" "}({pctBWperWk.toFixed(1)}% BW/wk · {deficitPctTDEE.toFixed(0)}% of TDEE).
+                  {fatCeiling != null && (
+                    overCeiling > 0
+                      ? ` Your fat stores can supply only ~${fatCeiling.toLocaleString()} kcal/day (≈${fatMassKg.toFixed(1)} kg fat mass × ~31 kcal/lb, Alpert 2005); the ~${overCeiling.toLocaleString()} kcal/day beyond that is drawn largely from lean tissue — on the order of ~${leanLoss14.toFixed(1)} kg of lean mass over 14 days if held (rough estimate; real partitioning varies with leanness, protein and training).`
+                      : ` This still sits within what your fat stores can supply (~${fatCeiling.toLocaleString()} kcal/day from ≈${fatMassKg.toFixed(1)} kg fat mass), so most loss should be fat — provided protein and training stay high.`
+                  )}
+                  {fatCeiling == null && " Add a body-fat % in your morning log to estimate how much of this deficit your fat stores can fuel before lean tissue is tapped."}
+                  {belowBMR && ` This intake is also below your estimated BMR (~${bmr.toLocaleString()} kcal) — not sustainable beyond brief periods.`}
+                </>
               )}
-              {fatCeiling == null && " Add a body-fat % in your morning log to estimate how much of this deficit your fat stores can fuel before lean tissue is tapped."}
-              {belowBMR && ` This intake is also below your estimated BMR (~${bmr.toLocaleString()} kcal) — not sustainable beyond brief periods.`}
             </div>
             <div style={{ fontSize: 10, color: "var(--text-dim)", lineHeight: 1.5, marginTop: 6 }}>
-              Evidence (Garthe 2011; Helms 2014) favours ~0.5–1% BW/wk to retain muscle and strength. If you go this low, keep it short, hold protein high ({phase === "cut" ? "2.2–2.4" : "≥2.0"} g/kg), and keep resistance training in.
+              {phase === "bulk"
+                ? `Evidence (Helms 2014; Slater & Phillips 2011) suggests ${magnitude === "conservative" ? "0.1–0.25" : magnitude === "moderate" ? "0.25–0.5" : "0.5–1.0"}% BW/wk maximises muscle:fat ratio. Keep protein at ≥1.8 g/kg and resistance training consistent.`
+                : `Evidence (Garthe 2011; Helms 2014) favours ~0.5–1% BW/wk to retain muscle and strength. If you go this low, keep it short, hold protein high (${phase === "cut" ? "2.2–2.4" : "≥2.0"} g/kg), and keep resistance training in.`}
             </div>
           </div>
         )}
         {riskLevel === "none" && deficit > 0 && (
           <div style={{ marginTop: 10, fontSize: 10, color: "#34d399", lineHeight: 1.5 }}>
             ✓ ~{pctBWperWk.toFixed(1)}% BW/wk — within the evidence-based range for retaining lean mass (Helms 2014; Garthe 2011).
+          </div>
+        )}
+        {riskLevel === "none" && phase === "bulk" && deficit <= 0 && (
+          <div style={{ marginTop: 10, fontSize: 10, color: "#34d399", lineHeight: 1.5 }}>
+            ✓ ~{pctBWperWk.toFixed(1)}% BW/wk — within the {magInfo?.label ?? magnitude} bulk range. Good muscle:fat ratio expected at this rate.
           </div>
         )}
       </div>
@@ -2909,7 +3559,7 @@ function ConfirmDialog({ title, message, actions, onClose }) {
   );
 }
 
-function ReportView({ reportRange, setReportRange, reportCustomStart, setReportCustomStart, reportCustomEnd, setReportCustomEnd, reportData, onExportMD, onCopyMD, onExportPDF }) {
+function ReportView({ reportRange, setReportRange, reportCustomStart, setReportCustomStart, reportCustomEnd, setReportCustomEnd, reportData, onExportMD, onCopyMD, onExportPDF, compThisData, compLastData }) {
   const r = reportData;
   const fmt1 = (v) => v != null ? v.toFixed(1) : "—";
   const fmt2 = (v) => v != null ? v.toFixed(2) : "—";
@@ -3055,6 +3705,70 @@ function ReportView({ reportRange, setReportRange, reportCustomStart, setReportC
       )}
 
       {/* Insights */}
+
+      {/* ── Comparison View: This Month vs Last Month ── */}
+      {compThisData && compLastData && (
+        <div style={{ marginTop: 24, marginBottom: 12 }}>
+          <div style={{ fontSize: 10, letterSpacing: "0.12em", textTransform: "uppercase", color: "var(--text-dim)", fontWeight: 600, marginBottom: 12 }}>Month Comparison</div>
+          <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10, overflow: "hidden" }}>
+            {/* Header */}
+            <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr", background: "var(--bg)", borderBottom: "1px solid var(--border)" }}>
+              <div style={{ padding: "10px 12px", fontSize: 9, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: "var(--text-dim)" }}>Metric</div>
+              <div style={{ padding: "10px 12px", fontSize: 9, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: "var(--text-dim)", textAlign: "center" }}>Last month</div>
+              <div style={{ padding: "10px 12px", fontSize: 9, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: "#a5b4fc", textAlign: "center" }}>This month</div>
+            </div>
+            {[
+              {
+                label: "Weight change",
+                last: compLastData.startWeight != null && compLastData.endWeight != null ? `${(compLastData.endWeight - compLastData.startWeight) >= 0 ? "+" : ""}${(compLastData.endWeight - compLastData.startWeight).toFixed(1)} kg` : "—",
+                this: compThisData.startWeight != null && compThisData.endWeight != null ? `${(compThisData.endWeight - compThisData.startWeight) >= 0 ? "+" : ""}${(compThisData.endWeight - compThisData.startWeight).toFixed(1)} kg` : "—",
+                better: (compLastData.startWeight != null && compLastData.endWeight != null && compThisData.startWeight != null && compThisData.endWeight != null) ? null : null,
+              },
+              {
+                label: "BF% change",
+                last: compLastData.bfChange != null ? `${compLastData.bfChange >= 0 ? "+" : ""}${compLastData.bfChange.toFixed(1)} pts` : "—",
+                this: compThisData.bfChange != null ? `${compThisData.bfChange >= 0 ? "+" : ""}${compThisData.bfChange.toFixed(1)} pts` : "—",
+              },
+              {
+                label: "Avg calories",
+                last: compLastData.avgCalories != null ? `${Math.round(compLastData.avgCalories).toLocaleString()} kcal` : "—",
+                this: compThisData.avgCalories != null ? `${Math.round(compThisData.avgCalories).toLocaleString()} kcal` : "—",
+              },
+              {
+                label: "Avg protein",
+                last: compLastData.avgProtein != null ? `${Math.round(compLastData.avgProtein)} g` : "—",
+                this: compThisData.avgProtein != null ? `${Math.round(compThisData.avgProtein)} g` : "—",
+              },
+              {
+                label: "Calorie adherence",
+                last: compLastData.onTargetDays != null && compLastData.targetComparable > 0 ? (compLastData.onTargetDays / compLastData.targetComparable * 100) : null != null ? `${Math.round(compLastData.onTargetDays != null && compLastData.targetComparable > 0 ? (compLastData.onTargetDays / compLastData.targetComparable * 100) : null)}%` : "—",
+                this: compThisData.onTargetDays != null && compThisData.targetComparable > 0 ? (compThisData.onTargetDays / compThisData.targetComparable * 100) : null != null ? `${Math.round(compThisData.onTargetDays != null && compThisData.targetComparable > 0 ? (compThisData.onTargetDays / compThisData.targetComparable * 100) : null)}%` : "—",
+                higherIsBetter: true,
+              },
+              {
+                label: "Protein target hit",
+                last: compLastData.proteinTracked > 0 ? (compLastData.proteinHitDays / compLastData.proteinTracked * 100) : null != null ? `${Math.round(compLastData.proteinTracked > 0 ? (compLastData.proteinHitDays / compLastData.proteinTracked * 100) : null)}%` : "—",
+                this: compThisData.proteinTracked > 0 ? (compThisData.proteinHitDays / compThisData.proteinTracked * 100) : null != null ? `${Math.round(compThisData.proteinTracked > 0 ? (compThisData.proteinHitDays / compThisData.proteinTracked * 100) : null)}%` : "—",
+                higherIsBetter: true,
+              },
+              {
+                label: "Days logged",
+                last: compLastData.entryCount != null ? `${compLastData.entryCount} days` : "—",
+                this: compThisData.entryCount != null ? `${compThisData.entryCount} days` : "—",
+                higherIsBetter: true,
+              },
+            ].map((row, i) => (
+              <div key={i} style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr", borderBottom: "1px solid var(--border)" }}>
+                <div style={{ padding: "10px 12px", fontSize: 11, color: "var(--text-soft)" }}>{row.label}</div>
+                <div style={{ padding: "10px 12px", fontSize: 12, fontWeight: 600, color: "var(--text-muted)", textAlign: "center" }}>{row.last}</div>
+                <div style={{ padding: "10px 12px", fontSize: 12, fontWeight: 700, color: "#a5b4fc", textAlign: "center" }}>{row.this}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{ fontSize: 9.5, color: "var(--text-faint)", marginTop: 8 }}>
+            Last month: {new Date(new Date().getFullYear(), new Date().getMonth() - 1, 1).toLocaleString("default", { month: "long" })} · This month: {new Date().toLocaleString("default", { month: "long" })} (to date)
+          </div>
+      )}
       <div style={{ fontSize: 10, letterSpacing: "0.12em", textTransform: "uppercase", color: "var(--text-dim)", fontWeight: 600, marginBottom: 12 }}>Insights &amp; Recommendations</div>
       <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 12 }}>
         {r.insights.map((ins, i) => {
