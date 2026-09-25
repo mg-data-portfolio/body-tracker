@@ -2291,6 +2291,7 @@ export default function App() {
           dietBreak={dietBreak}
           weeksCutting={weeksCutting}
           showRec={showDietBreakRec}
+          phase={phase}
           maintenanceTarget={maintenanceTarget}
           today={today}
           onAgree={() => saveDietBreak({ active: true, startDate: today, endDate: formatDate(new Date(Date.now() + 14 * 86400000)), dismissedAt: null })}
@@ -2459,7 +2460,7 @@ function PhaseTransitionModal({ phaseTransition, onConfirm, onCancel }) {
 }
 
 // ── Diet Break Banner ──
-function DietBreakBanner({ dietBreak, weeksCutting, showRec, maintenanceTarget, today, onAgree, onDecline, onEnd }) {
+function DietBreakBanner({ dietBreak, weeksCutting, showRec, phase, maintenanceTarget, today, onAgree, onDecline, onEnd }) {
   if (dietBreak?.active) {
     const start = dietBreak.startDate;
     const dayIn = start ? Math.floor((new Date(today + "T00:00:00") - new Date(start + "T00:00:00")) / 86400000) + 1 : 1;
@@ -2483,22 +2484,35 @@ function DietBreakBanner({ dietBreak, weeksCutting, showRec, maintenanceTarget, 
       </div>
     );
   }
-  if (!showRec) return null;
-  return (
-    <div style={{ marginTop: 14, background: "#fbbf2415", border: "1px solid #fbbf2440", borderRadius: 10, padding: "14px" }}>
-      <div style={{ fontSize: 11, fontWeight: 700, color: "#fbbf24", marginBottom: 6 }}>⚠️ Diet break recommended</div>
-      <div style={{ fontSize: 10.5, color: "var(--text-soft)", lineHeight: 1.55, marginBottom: 10 }}>
-        You've been cutting for <strong style={{ color: "var(--text)" }}>{weeksCutting} weeks</strong>. Evidence (Byrne et al. 2017 — MATADOR study) suggests a 1–2 week diet break at maintenance every 6–8 weeks produces significantly better fat loss outcomes than continuous restriction, by preventing adaptive thermogenesis.
-      </div>
-      <div style={{ display: "flex", gap: 8 }}>
-        <button onClick={onAgree} style={{ background: "#fbbf24", color: "var(--surface)", border: "none", borderRadius: 6, padding: "7px 16px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
-          Start diet break
-        </button>
-        <button onClick={onDecline} style={{ background: "transparent", color: "var(--text-muted)", border: "1px solid var(--border)", borderRadius: 6, padding: "7px 14px", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
-          Not yet
-        </button>
-      </div>
+  const manualTrigger = phase === "cut" && !dietBreak?.active ? (
+    <div style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 8 }}>
+      <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 11, color: "var(--text-soft)" }}>
+        <input type="checkbox" onChange={e => e.target.checked && onAgree()}
+          style={{ accentColor: "#34d399", width: 14, height: 14 }} />
+        Manual diet break / deload week — set target to maintenance
+      </label>
     </div>
+  ) : null;
+
+  if (!showRec) return manualTrigger;
+  return (
+    <>
+      <div style={{ marginTop: 14, background: "#fbbf2415", border: "1px solid #fbbf2440", borderRadius: 10, padding: "14px" }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: "#fbbf24", marginBottom: 6 }}>⚠️ Diet break recommended</div>
+        <div style={{ fontSize: 10.5, color: "var(--text-soft)", lineHeight: 1.55, marginBottom: 10 }}>
+          You've been cutting for <strong style={{ color: "var(--text)" }}>{weeksCutting} weeks</strong>. Evidence (Byrne et al. 2017 — MATADOR study) suggests a 1–2 week diet break at maintenance every 6–8 weeks produces significantly better fat loss outcomes than continuous restriction, by preventing adaptive thermogenesis.
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={onAgree} style={{ background: "#fbbf24", color: "var(--surface)", border: "none", borderRadius: 6, padding: "7px 16px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+            Start diet break
+          </button>
+          <button onClick={onDecline} style={{ background: "transparent", color: "var(--text-muted)", border: "1px solid var(--border)", borderRadius: 6, padding: "7px 14px", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
+            Not yet
+          </button>
+        </div>
+      </div>
+      {manualTrigger}
+    </>
   );
 }
 
