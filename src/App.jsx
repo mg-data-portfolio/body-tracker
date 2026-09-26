@@ -3724,47 +3724,47 @@ function ReportView({ reportRange, setReportRange, reportCustomStart, setReportC
               {
                 label: "Weight change",
                 last: compLastData.startWeight != null && compLastData.endWeight != null ? `${(compLastData.endWeight - compLastData.startWeight) >= 0 ? "+" : ""}${(compLastData.endWeight - compLastData.startWeight).toFixed(1)} kg` : "—",
-                this: compThisData.startWeight != null && compThisData.endWeight != null ? `${(compThisData.endWeight - compThisData.startWeight) >= 0 ? "+" : ""}${(compThisData.endWeight - compThisData.startWeight).toFixed(1)} kg` : "—",
+                curr: compThisData.startWeight != null && compThisData.endWeight != null ? `${(compThisData.endWeight - compThisData.startWeight) >= 0 ? "+" : ""}${(compThisData.endWeight - compThisData.startWeight).toFixed(1)} kg` : "—",
                 better: (compLastData.startWeight != null && compLastData.endWeight != null && compThisData.startWeight != null && compThisData.endWeight != null) ? null : null,
               },
               {
                 label: "BF% change",
                 last: compLastData.bfChange != null ? `${compLastData.bfChange >= 0 ? "+" : ""}${compLastData.bfChange.toFixed(1)} pts` : "—",
-                this: compThisData.bfChange != null ? `${compThisData.bfChange >= 0 ? "+" : ""}${compThisData.bfChange.toFixed(1)} pts` : "—",
+                curr: compThisData.bfChange != null ? `${compThisData.bfChange >= 0 ? "+" : ""}${compThisData.bfChange.toFixed(1)} pts` : "—",
               },
               {
                 label: "Avg calories",
                 last: compLastData.avgCalories != null ? `${Math.round(compLastData.avgCalories).toLocaleString()} kcal` : "—",
-                this: compThisData.avgCalories != null ? `${Math.round(compThisData.avgCalories).toLocaleString()} kcal` : "—",
+                curr: compThisData.avgCalories != null ? `${Math.round(compThisData.avgCalories).toLocaleString()} kcal` : "—",
               },
               {
                 label: "Avg protein",
                 last: compLastData.avgProtein != null ? `${Math.round(compLastData.avgProtein)} g` : "—",
-                this: compThisData.avgProtein != null ? `${Math.round(compThisData.avgProtein)} g` : "—",
+                curr: compThisData.avgProtein != null ? `${Math.round(compThisData.avgProtein)} g` : "—",
               },
               {
                 label: "Calorie adherence",
                 last: compLastData.onTargetDays != null && compLastData.targetComparable > 0 ? (compLastData.onTargetDays / compLastData.targetComparable * 100) : null != null ? `${Math.round(compLastData.onTargetDays != null && compLastData.targetComparable > 0 ? (compLastData.onTargetDays / compLastData.targetComparable * 100) : null)}%` : "—",
-                this: compThisData.onTargetDays != null && compThisData.targetComparable > 0 ? (compThisData.onTargetDays / compThisData.targetComparable * 100) : null != null ? `${Math.round(compThisData.onTargetDays != null && compThisData.targetComparable > 0 ? (compThisData.onTargetDays / compThisData.targetComparable * 100) : null)}%` : "—",
+                curr: compThisData.onTargetDays != null && compThisData.targetComparable > 0 ? (compThisData.onTargetDays / compThisData.targetComparable * 100) : null != null ? `${Math.round(compThisData.onTargetDays != null && compThisData.targetComparable > 0 ? (compThisData.onTargetDays / compThisData.targetComparable * 100) : null)}%` : "—",
                 higherIsBetter: true,
               },
               {
                 label: "Protein target hit",
                 last: compLastData.proteinTracked > 0 ? (compLastData.proteinHitDays / compLastData.proteinTracked * 100) : null != null ? `${Math.round(compLastData.proteinTracked > 0 ? (compLastData.proteinHitDays / compLastData.proteinTracked * 100) : null)}%` : "—",
-                this: compThisData.proteinTracked > 0 ? (compThisData.proteinHitDays / compThisData.proteinTracked * 100) : null != null ? `${Math.round(compThisData.proteinTracked > 0 ? (compThisData.proteinHitDays / compThisData.proteinTracked * 100) : null)}%` : "—",
+                curr: compThisData.proteinTracked > 0 ? (compThisData.proteinHitDays / compThisData.proteinTracked * 100) : null != null ? `${Math.round(compThisData.proteinTracked > 0 ? (compThisData.proteinHitDays / compThisData.proteinTracked * 100) : null)}%` : "—",
                 higherIsBetter: true,
               },
               {
                 label: "Days logged",
                 last: compLastData.entryCount != null ? `${compLastData.entryCount} days` : "—",
-                this: compThisData.entryCount != null ? `${compThisData.entryCount} days` : "—",
+                curr: compThisData.entryCount != null ? `${compThisData.entryCount} days` : "—",
                 higherIsBetter: true,
               },
             ].map((row, i) => (
               <div key={i} style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr", borderBottom: "1px solid var(--border)" }}>
                 <div style={{ padding: "10px 12px", fontSize: 11, color: "var(--text-soft)" }}>{row.label}</div>
                 <div style={{ padding: "10px 12px", fontSize: 12, fontWeight: 600, color: "var(--text-muted)", textAlign: "center" }}>{row.last}</div>
-                <div style={{ padding: "10px 12px", fontSize: 12, fontWeight: 700, color: "#a5b4fc", textAlign: "center" }}>{row.this}</div>
+                <div style={{ padding: "10px 12px", fontSize: 12, fontWeight: 700, color: "#a5b4fc", textAlign: "center" }}>{row.curr}</div>
               </div>
             ))}
           </div>
