@@ -2670,7 +2670,6 @@ function WaterLogger({ date, waterLog, latestWeight, addWater, setGymDay, resetW
         )}
       </div>
     </div>
-  </div>
   );
 }
 
