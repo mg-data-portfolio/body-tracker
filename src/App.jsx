@@ -804,20 +804,10 @@ export default function App() {
   const targetOverride = dietBreakActive || transitionActive || refeedToday;
   const target = targetOverride ? maintenanceTarget : baseTarget;
 
-  // Cut start date (for diet break recommendation)
-  const sortedHistAsc = [...phaseHist].sort((a, b) => a.date.localeCompare(b.date));
-  let cutStartDate = null;
-  if (phase === "cut") {
-    let lastNonCut = null;
-    for (const h of sortedHistAsc) { if (h.phase !== "cut" && h.date <= today) lastNonCut = h; }
-    for (const h of sortedHistAsc) {
-      if (h.phase === "cut" && (!lastNonCut || h.date > lastNonCut.date)) { cutStartDate = h.date; break; }
-    }
-  }
-  const weeksCutting = cutStartDate
-    ? Math.floor((new Date(today + "T00:00:00") - new Date(cutStartDate + "T00:00:00")) / (7 * 86400000))
-    : 0;
-  const showDietBreakRec = phase === "cut" && weeksCutting >= 6 && !dietBreak?.active &&
+  // Cut start date from cutRunInfo
+  const cutStartDate = cutRunInfo?.runStart ?? null;
+  const weeksCutting = Math.round(cutRunInfo?.weeks ?? 0);
+  const showDietBreakRec = phase === "cut" && (cutRunInfo?.due === true) && !dietBreak?.active &&
     (!dietBreak?.dismissedAt || Math.floor((new Date(today + "T00:00:00") - new Date(dietBreak.dismissedAt + "T00:00:00")) / 86400000) > 14);
 
   // Next refeed recommendation (Saturdays, min 2 days ahead, min 5 days since last)
@@ -1049,7 +1039,7 @@ export default function App() {
     if (goalInfo && !goalInfo.atGoal && goalInfo.onPace != null) {
       insights.push({ type: goalInfo.onPace ? "good" : "warn", text: goalInfo.onPace ? "Currently on pace to reach your goal weight by the target date." : "Currently behind pace to reach your goal weight by the target date." });
     }
-    if (dietBreak?.due) insights.push({ type: "warn", text: `You've been cutting continuously for ~${Math.round(dietBreak.weeks)} weeks — a planned maintenance week is recommended.` });
+    if (cutRunInfo?.due) insights.push({ type: "warn", text: `You've been cutting continuously for ~${Math.round(cutRunInfo?.weeks ?? 0)} weeks — a planned maintenance week is recommended.` });
     if (insights.length === 0) insights.push({ type: "neutral", text: "Nothing notable to flag for this period — keep logging consistently to sharpen future insights." });
 
     return {
@@ -1112,7 +1102,7 @@ export default function App() {
 
   // ── Diet-break / refeed awareness ──
   // Cumulative continuous days in a cut, from the most recent phase-history run.
-  const dietBreak = (() => {
+  const cutRunInfo = (() => {
     if (phase !== "cut") return null;
     const hist = [...phaseHist].sort((a, b) => a.date.localeCompare(b.date));
     // find the start of the current uninterrupted cut run
@@ -2002,11 +1992,11 @@ export default function App() {
         )}
 
         {/* ── Diet-break suggestion (long cut) ── */}
-        {dietBreak?.due && (
+        {cutRunInfo?.due && (
           <div style={{ marginTop: 28, marginBottom: 4, background: "var(--surface)", border: "1px solid #60a5fa55", borderLeft: "3px solid #60a5fa", borderRadius: 8, padding: "14px 16px" }}>
             <div style={{ fontSize: 12, fontWeight: 700, color: "#60a5fa", marginBottom: 8 }}>Consider a diet break</div>
             <div style={{ fontSize: 11, color: "var(--text-soft)", lineHeight: 1.55, marginBottom: 10 }}>
-              You've been cutting for about {Math.round(dietBreak.weeks)} weeks straight. The evidence (Helms; the MATADOR study) supports a planned <strong style={{ color: "var(--text)" }}>maintenance week</strong> every 6–8 weeks of continuous deficit — it helps restore hormones (leptin, thyroid), reduces fatigue, and improves long-term adherence and muscle retention. Eating at maintenance for ~7 days won't undo your progress.
+              You've been cutting for about {Math.round(cutRunInfo?.weeks ?? 0)} weeks straight. The evidence (Helms; the MATADOR study) supports a planned <strong style={{ color: "var(--text)" }}>maintenance week</strong> every 6–8 weeks of continuous deficit — it helps restore hormones (leptin, thyroid), reduces fatigue, and improves long-term adherence and muscle retention. Eating at maintenance for ~7 days won't undo your progress.
             </div>
             <button onClick={() => setPhaseAndMag("maintain", "maintain")}
               style={{ background: "#60a5fa", color: "#06121f", border: "none", borderRadius: 6, padding: "7px 14px", fontSize: 11, fontWeight: 700, letterSpacing: "0.03em", cursor: "pointer" }}>
