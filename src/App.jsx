@@ -2315,7 +2315,7 @@ export default function App() {
           </div>
         )}
 
-        {/* ── Water Logger ── */}}
+        {/* ── Water Logger ── */}
         <WaterLogger
           date={today}
           waterLog={waterLog}
@@ -3771,6 +3771,7 @@ function ReportView({ reportRange, setReportRange, reportCustomStart, setReportC
           <div style={{ fontSize: 9.5, color: "var(--text-faint)", marginTop: 8 }}>
             Last month: {new Date(new Date().getFullYear(), new Date().getMonth() - 1, 1).toLocaleString("default", { month: "long" })} · This month: {new Date().toLocaleString("default", { month: "long" })} (to date)
           </div>
+      </div>
       )}
       <div style={{ fontSize: 10, letterSpacing: "0.12em", textTransform: "uppercase", color: "var(--text-dim)", fontWeight: 600, marginBottom: 12 }}>Insights &amp; Recommendations</div>
       <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 12 }}>
