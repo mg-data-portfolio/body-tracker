@@ -8,8 +8,6 @@ const CYCLE_KEY = "body-tracker-cycle";
 const GOAL_KEY = "body-tracker-goal";
 const PHASEHIST_KEY = "body-tracker-phasehist";
 const THEME_KEY = "body-tracker-theme";
-const WATER_KEY = "body-tracker-water";
-const DIETBREAK_KEY = "body-tracker-diet-break";
 
 // Structural color tokens. Accent colors (phase/macro) are left as literal hex
 // since they read well on both themes.
@@ -462,10 +460,6 @@ export default function App() {
   const [goal, setGoal] = useState(null);
   const [goalOpen, setGoalOpen] = useState(false);
   const [reviewConfirming, setReviewConfirming] = useState(false);
-  // Water logger: { [date]: { plain: number (ml), carbMix: number (ml), gymDay: bool } }
-  const [waterLog, setWaterLog] = useState({});
-  // Diet break: { active, startDate }
-  const [dietBreak, setDietBreak] = useState(null);
   // Phase history: array of { date, phase, magnitude }
   const [phaseHist, setPhaseHist] = useState([]);
   const fileInputRef = useRef(null);
@@ -491,10 +485,6 @@ export default function App() {
       if (ph) setPhaseHist(ph);
       const t = store.get(THEME_KEY);
       if (t === "light" || t === "dark") setTheme(t);
-      const w = store.get(WATER_KEY);
-      if (w) setWaterLog(w);
-      const db = store.get(DIETBREAK_KEY);
-      if (db) setDietBreak(db);
     } catch (_) {}
     setLoaded(true);
   }, []);
@@ -548,24 +538,6 @@ export default function App() {
     setGoal(next);
     store.set(GOAL_KEY, next);
   };
-  const saveWater = (next) => {
-    setWaterLog(next);
-    store.set(WATER_KEY, next);
-  };
-  const saveDietBreak = (next) => { setDietBreak(next); store.set(DIETBREAK_KEY, next); };
-  const addWater = (date, field, amountMl) => {
-    const day = waterLog[date] || { plain: 0, carbMix: 0, gymDay: false };
-    const next = { ...waterLog, [date]: { ...day, [field]: Math.max(0, (day[field] || 0) + amountMl) } };
-    saveWater(next);
-  };
-  const setGymDay = (date, val) => {
-    const day = waterLog[date] || { plain: 0, carbMix: 0, gymDay: false };
-    saveWater({ ...waterLog, [date]: { ...day, gymDay: val } });
-  };
-  const resetWater = (date) => {
-    const day = waterLog[date] || { plain: 0, carbMix: 0, gymDay: false };
-    saveWater({ ...waterLog, [date]: { plain: 0, carbMix: 0, gymDay: day.gymDay } });
-  };
 
   const savePhaseHist = (next) => {
     setPhaseHist(next);
@@ -577,8 +549,10 @@ export default function App() {
     setPhase(p);
     setMagnitude(m);
     persistSettings(p, m);
+    // New phase/intensity → start a fresh review cycle anchored today
     const nt = calcTarget(measuredTDEE ?? calcBaselineTDEE(profile, macroWeight), p, m);
-    if (nt != null) saveCycle({ anchorDate: today, lockedTarget: nt, syncedPhaseDate: latestPhaseChangeDate ?? today });
+    if (nt != null) saveCycle({ anchorDate: today, lockedTarget: nt, syncedPhaseDate: today });
+    // Append to phase history (replace same-day record so toggling doesn't spam)
     if (changed) {
       const w = latestWeight;
       const filtered = phaseHist.filter(h => h.date !== today);
@@ -751,15 +725,7 @@ export default function App() {
   // - Review is just a proposal — doesn't affect daily target until Apply is clicked
   // - If no cycle: use formula target
   // The ONLY ways to change target are: (1) change phase/magnitude, or (2) click Apply on review
-  const baseTarget = (cycle && cycle.lockedTarget != null) ? cycle.lockedTarget : formulaTarget;
-
-  // Maintenance target for diet breaks, transitions and refeed days
-  const maintenanceTarget = effectiveTDEE ? Math.round(effectiveTDEE / 25) * 25 : baseTarget;
-
-  // Override: diet break active → use maintenance target
-  const dietBreakActive = dietBreak?.active === true;
-  const target = dietBreakActive ? maintenanceTarget : baseTarget;
-  const weeksCutting = Math.round(cutRunInfo?.weeks ?? 0);
+  const target = (cycle && cycle.lockedTarget != null) ? cycle.lockedTarget : formulaTarget;
 
   // Compute the review proposal when due
   let review = null;
@@ -873,9 +839,9 @@ export default function App() {
   };
   const historicalTargetCache = {};
   const targetForDate = (dateStr) => {
-    // Only show vs-target for dates within the current cycle anchor
-    // Dates before the anchor were under a different target — show nothing
-    if (!cycle?.anchorDate || dateStr < cycle.anchorDate) return null;
+    // Always use the current locked target for vs-target calculations
+    // This ensures log rows are consistent with the daily target display
+    // Historical formula targets are unreliable as TDEE changes over time
     return target;
   };
 
@@ -906,12 +872,11 @@ export default function App() {
     const bfReg = bfPts.length >= 2 ? linReg(bfPts) : null;
     const weightChange = wReg ? wReg.slope * (wPts[wPts.length - 1].x - wPts[0].x) / 86400000 : null;
     const weightChangePerWeek = wReg ? wReg.slope * 7 * 86400000 : null;
+    const bfChange = bfReg ? bfReg.slope * (bfPts[bfPts.length - 1].x - bfPts[0].x) / 86400000 : null;
     const startWeight = wRows.length ? wRows[0].weight : null;
     const endWeight = wRows.length ? wRows[wRows.length - 1].weight : null;
     const startBf = bfRows.length ? bfRows[0].bf : null;
     const endBf = bfRows.length ? bfRows[bfRows.length - 1].bf : null;
-    // Simple start-to-end delta — regression slope gave near-zero on noisy data
-    const bfChange = (startBf != null && endBf != null) ? endBf - startBf : null;
 
     // Adherence to historical target within range
     let onTargetDays = 0, overDays = 0, underDays = 0, targetComparable = 0;
@@ -972,7 +937,7 @@ export default function App() {
     if (goalInfo && !goalInfo.atGoal && goalInfo.onPace != null) {
       insights.push({ type: goalInfo.onPace ? "good" : "warn", text: goalInfo.onPace ? "Currently on pace to reach your goal weight by the target date." : "Currently behind pace to reach your goal weight by the target date." });
     }
-    if (cutRunInfo?.due) insights.push({ type: "warn", text: `You've been cutting continuously for ~${Math.round(cutRunInfo?.weeks ?? 0)} weeks — a planned maintenance week is recommended.` });
+    if (dietBreak?.due) insights.push({ type: "warn", text: `You've been cutting continuously for ~${Math.round(dietBreak.weeks)} weeks — a planned maintenance week is recommended.` });
     if (insights.length === 0) insights.push({ type: "neutral", text: "Nothing notable to flag for this period — keep logging consistently to sharpen future insights." });
 
     return {
@@ -1035,7 +1000,7 @@ export default function App() {
 
   // ── Diet-break / refeed awareness ──
   // Cumulative continuous days in a cut, from the most recent phase-history run.
-  const cutRunInfo = (() => {
+  const dietBreak = (() => {
     if (phase !== "cut") return null;
     const hist = [...phaseHist].sort((a, b) => a.date.localeCompare(b.date));
     // find the start of the current uninterrupted cut run
@@ -1672,8 +1637,6 @@ export default function App() {
           </div>
         )}
 
-
-
         {/* ── Entry: split morning / evening cards ── */}
         <div style={{ marginTop: 24, marginBottom: 28 }}>
           {/* Date bar — arrow stepper + tappable label that opens the calendar */}
@@ -1846,11 +1809,11 @@ export default function App() {
         )}
 
         {/* ── Diet-break suggestion (long cut) ── */}
-        {cutRunInfo?.due && (
+        {dietBreak?.due && (
           <div style={{ marginTop: 28, marginBottom: 4, background: "var(--surface)", border: "1px solid #60a5fa55", borderLeft: "3px solid #60a5fa", borderRadius: 8, padding: "14px 16px" }}>
             <div style={{ fontSize: 12, fontWeight: 700, color: "#60a5fa", marginBottom: 8 }}>Consider a diet break</div>
             <div style={{ fontSize: 11, color: "var(--text-soft)", lineHeight: 1.55, marginBottom: 10 }}>
-              You've been cutting for about {Math.round(cutRunInfo?.weeks ?? 0)} weeks straight. The evidence (Helms; the MATADOR study) supports a planned <strong style={{ color: "var(--text)" }}>maintenance week</strong> every 6–8 weeks of continuous deficit — it helps restore hormones (leptin, thyroid), reduces fatigue, and improves long-term adherence and muscle retention. Eating at maintenance for ~7 days won't undo your progress.
+              You've been cutting for about {Math.round(dietBreak.weeks)} weeks straight. The evidence (Helms; the MATADOR study) supports a planned <strong style={{ color: "var(--text)" }}>maintenance week</strong> every 6–8 weeks of continuous deficit — it helps restore hormones (leptin, thyroid), reduces fatigue, and improves long-term adherence and muscle retention. Eating at maintenance for ~7 days won't undo your progress.
             </div>
             <button onClick={() => setPhaseAndMag("maintain", "maintain")}
               style={{ background: "#60a5fa", color: "#06121f", border: "none", borderRadius: 6, padding: "7px 14px", fontSize: 11, fontWeight: 700, letterSpacing: "0.03em", cursor: "pointer" }}>
@@ -2130,25 +2093,6 @@ export default function App() {
         </div>
 
 
-        {/* ── Diet Break / Deload Checkbox ── */}
-        <DietBreakBanner
-          dietBreak={dietBreak}
-          maintenanceTarget={maintenanceTarget}
-          today={today}
-          onStart={() => saveDietBreak({ active: true, startDate: today })}
-          onEnd={() => saveDietBreak({ active: false, startDate: null })}
-        />
-
-        {/* ── Water Logger ── */}
-        <WaterLogger
-          date={today}
-          waterLog={waterLog}
-          latestWeight={latestWeight}
-          addWater={addWater}
-          setGymDay={setGymDay}
-          resetWater={resetWater}
-        />
-
         {/* ── Log Table ── */}
         {displayRows.length > 0 && (
           <div>
@@ -2228,134 +2172,6 @@ export default function App() {
   );
 }
 
-// ── Diet Break Banner ──
-function DietBreakBanner({ dietBreak, maintenanceTarget, today, onStart, onEnd }) {
-  if (dietBreak?.active) {
-    const start = dietBreak.startDate;
-    const dayIn = start ? Math.floor((new Date(today + "T00:00:00") - new Date(start + "T00:00:00")) / 86400000) + 1 : 1;
-    const pct = Math.min(100, Math.round((dayIn / 14) * 100));
-    return (
-      <div style={{ marginTop: 14, background: "#34d39915", border: "1px solid #34d39940", borderRadius: 10, padding: "14px" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-          <span style={{ fontSize: 11, fontWeight: 700, color: "#34d399" }}>🌿 Diet break / deload active — Day {dayIn}</span>
-          <span style={{ fontSize: 10, color: "var(--text-muted)" }}>{maintenanceTarget?.toLocaleString()} kcal</span>
-        </div>
-        <div style={{ height: 6, borderRadius: 999, background: "var(--bg)", overflow: "hidden", marginBottom: 10 }}>
-          <div style={{ height: "100%", width: `${pct}%`, background: "#34d399", borderRadius: 999, transition: "width 400ms" }} />
-        </div>
-        <div style={{ fontSize: 10, color: "var(--text-soft)", lineHeight: 1.5, marginBottom: 10 }}>
-          Eating at maintenance. Keep training but reduce intensity — hormones stabilise over 1–2 weeks, improving the next phase.
-        </div>
-        <button onClick={onEnd} style={{ background: "transparent", color: "var(--text-muted)", border: "1px solid var(--border)", borderRadius: 6, padding: "6px 14px", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
-          End diet break
-        </button>
-      </div>
-    );
-  }
-  return (
-    <div style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 8 }}>
-      <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 11, color: "var(--text-soft)" }}>
-        <input type="checkbox" onChange={e => { if (e.target.checked) onStart(); }}
-          style={{ accentColor: "#34d399", width: 14, height: 14 }} />
-        Deload / diet break — switch to maintenance calories
-      </label>
-    </div>
-  );
-}
-
-// ── Water Logger Component ──
-function WaterLogger({ date, waterLog, latestWeight, addWater, setGymDay, resetWater }) {
-  const [customMl, setCustomMl] = useState("");
-  const [customMlCarb, setCustomMlCarb] = useState("");
-  const day = waterLog[date] || { plain: 0, carbMix: 0, gymDay: false };
-  const baseGoal = latestWeight ? Math.round(latestWeight * 35 / 100) * 100 : 2500;
-  const gymBonus = day.gymDay ? 750 : 0;
-  const goal = baseGoal + gymBonus;
-  const totalHydration = (day.plain || 0) + (day.carbMix || 0);
-  const pct = Math.min(100, Math.round((totalHydration / goal) * 100));
-  const gaugeColor = pct >= 100 ? "#34d399" : pct >= 66 ? "#60a5fa" : pct >= 33 ? "#818cf8" : "var(--border-strong)";
-  const presets = [150, 250, 330, 500, 750];
-  const card = { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10, padding: "14px 14px 12px" };
-  const btn = { border: "1px solid var(--border)", borderRadius: 6, padding: "5px 10px", fontSize: 11, fontWeight: 600, cursor: "pointer", background: "var(--bg)", color: "var(--text-soft)" };
-  return (
-    <div style={{ marginTop: 24 }}>
-      <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--text-muted)", marginBottom: 10 }}>Hydration</div>
-      <div style={card}>
-        {/* Gym day toggle + goal */}
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-          <div style={{ fontSize: 11, color: "var(--text-soft)" }}>
-            Goal: <strong style={{ color: "var(--text)" }}>{(goal / 1000).toFixed(1)}L</strong>
-            <span style={{ color: "var(--text-dim)", marginLeft: 4 }}>({(baseGoal/1000).toFixed(1)}L base{day.gymDay ? " +0.75L gym" : ""})</span>
-          </div>
-          <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 11, color: "var(--text-soft)" }}>
-            <input type="checkbox" checked={day.gymDay} onChange={e => setGymDay(date, e.target.checked)}
-              style={{ accentColor: "#6366f1", width: 14, height: 14 }} />
-            Gym day
-          </label>
-        </div>
-        {/* Gauge */}
-        <div style={{ marginBottom: 10 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-            <span style={{ fontSize: 20, fontWeight: 800, color: pct >= 100 ? "#34d399" : "var(--text)" }}>
-              {(totalHydration / 1000).toFixed(2)}L
-            </span>
-            <span style={{ fontSize: 11, color: "var(--text-muted)", alignSelf: "flex-end", marginBottom: 3 }}>{pct}% of goal</span>
-          </div>
-          <div style={{ height: 10, borderRadius: 999, background: "var(--bg)", overflow: "hidden", border: "1px solid var(--border)" }}>
-            <div style={{ height: "100%", width: `${pct}%`, background: gaugeColor, borderRadius: 999, transition: "width 400ms ease, background 400ms ease" }} />
-          </div>
-          {pct >= 100 && <div style={{ fontSize: 10, color: "#34d399", marginTop: 4, textAlign: "center" }}>✓ Goal reached</div>}
-          {totalHydration > 0 && (
-            <div style={{ display: "flex", gap: 12, marginTop: 8 }}>
-              <span style={{ fontSize: 10, color: "var(--text-muted)" }}>
-                💧 Water: <strong style={{ color: "var(--text)" }}>{(( day.plain || 0) / 1000).toFixed(2)}L</strong>
-              </span>
-              {day.carbMix > 0 && (
-                <span style={{ fontSize: 10, color: "var(--text-muted)" }}>
-                  🟡 Carb mix: <strong style={{ color: "#f59e0b" }}>{((day.carbMix || 0) / 1000).toFixed(2)}L</strong>
-                </span>
-              )}
-            </div>
-          )}
-        </div>
-        {/* Quick add water buttons */}
-        <div style={{ fontSize: 9, color: "var(--text-muted)", fontWeight: 600, letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 6 }}>Add water</div>
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
-          {presets.map(ml => (
-            <button key={ml} onClick={() => addWater(date, "plain", ml)} style={btn}>{ml}ml</button>
-          ))}
-        </div>
-        <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
-          <input type="number" inputMode="decimal" value={customMl} onChange={e => setCustomMl(e.target.value)}
-            placeholder="Custom ml" style={{ flex: 1, background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 6, padding: "6px 10px", fontSize: 12, color: "var(--text)", outline: "none" }} />
-          <button onClick={() => { if (customMl !== "") { addWater(date, "plain", Number(customMl)); setCustomMl(""); } }}
-            style={{ ...btn, background: "#6366f1", color: "#fff", border: "none", padding: "6px 14px" }}>Add</button>
-        </div>
-        {/* Carb mix section */}
-        <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12 }}>
-          <div style={{ fontSize: 9, color: "var(--text-muted)", fontWeight: 600, letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 6 }}>
-            Carb mix (maltodextrin + water) <span style={{ color: "var(--text-faint)", fontWeight: 400 }}>counts toward hydration — mix at 6–8% (50g per 625–750ml)</span>
-          </div>
-          <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
-            <input type="number" inputMode="decimal" value={customMlCarb} onChange={e => setCustomMlCarb(e.target.value)}
-              placeholder="ml" style={{ flex: 1, background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 6, padding: "6px 10px", fontSize: 12, color: "var(--text)", outline: "none" }} />
-            <button onClick={() => { if (customMlCarb !== "") { addWater(date, "carbMix", Number(customMlCarb)); setCustomMlCarb(""); } }}
-              style={{ ...btn, background: "#f59e0b", color: "#fff", border: "none", padding: "6px 14px" }}>Log</button>
-          </div>
-
-        </div>
-        {/* Reset */}
-        {totalHydration > 0 && (
-          <button onClick={() => resetWater(date)} style={{ marginTop: 12, background: "none", border: "none", color: "var(--text-faint)", fontSize: 10, cursor: "pointer", textDecoration: "underline" }}>
-            Reset today
-          </button>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// ── Mini Phase Planner Component ──
 function TrendsView({ range, setRange, metric, setMetric, chartWithTrend, metricRows, metricCfg, totalChange, weeklyChange, theme, overlayData, phaseMarkers }) {
   // Recharts renders SVG attributes that don't resolve CSS var(), so use literal colors.
   const c = theme === "light"
@@ -2594,15 +2410,8 @@ function MacrosView({ macros, target, tdee, phase, phaseInfo, magInfo, magnitude
   const belowBMR = bmr != null && activeCals < bmr;
   let riskLevel = "none"; // "none" | "caution" | "high"
   if (deficit > 0) {
-    // Cut-side warnings
     if (pctBWperWk > 1.5 || belowBMR || (overCeiling != null && overCeiling > 150)) riskLevel = "high";
     else if (pctBWperWk > 1.0 || deficitPctTDEE > 25 || (overCeiling != null && overCeiling > 0)) riskLevel = "caution";
-  } else if (phase === "bulk") {
-    // Bulk-side warnings: flag when rate exceeds upper bound of selected magnitude
-    const bulkCeilings = { conservative: 0.25, moderate: 0.5, aggressive: 1.0 };
-    const bulkCeiling = bulkCeilings[magnitude] ?? 0.5;
-    if (pctBWperWk > bulkCeiling * 2) riskLevel = "high";
-    else if (pctBWperWk > bulkCeiling) riskLevel = "caution";
   }
   const riskColor = riskLevel === "high" ? "#f87171" : "#fbbf24";
 
@@ -2658,48 +2467,28 @@ function MacrosView({ macros, target, tdee, phase, phaseInfo, magInfo, magnitude
             <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
               <span style={{ fontSize: 12 }}>{riskLevel === "high" ? "🛑" : "⚠️"}</span>
               <span style={{ fontSize: 11, fontWeight: 700, color: riskColor, letterSpacing: "0.02em" }}>
-                {phase === "bulk"
-                  ? (riskLevel === "high" ? "Excessive surplus — mostly fat gain from here" : "Above recommended range — fat gain accelerating")
-                  : (riskLevel === "high" ? "Aggressive deficit — lean-mass loss likely" : "Steep deficit — watch lean mass & adherence")}
+                {riskLevel === "high" ? "Aggressive deficit — lean-mass loss likely" : "Steep deficit — watch lean mass & adherence"}
               </span>
             </div>
             <div style={{ fontSize: 10.5, color: "var(--text-soft)", lineHeight: 1.55 }}>
-              {phase === "bulk" ? (
-                <>
-                  At {activeCals.toLocaleString()} kcal you're +{Math.abs(deficit).toLocaleString()} kcal/day above TDEE ({pctBWperWk.toFixed(1)}% BW/wk).
-                  {" "}The upper bound for {magInfo?.label ?? magnitude} bulk is ~{(phase === "bulk" ? ({ conservative: 0.25, moderate: 0.5, aggressive: 1.0 }[magnitude] ?? 0.5) : 0).toFixed(2)}% BW/wk.
-                  {" "}Above this, a greater proportion of gain is fat rather than muscle (Slater & Phillips 2011; Helms 2014).
-                  {riskLevel === "high" && " At this rate the surplus substantially exceeds what muscle tissue can absorb — reduce intake to stay within your chosen magnitude."}
-                </>
-              ) : (
-                <>
-                  At {activeCals.toLocaleString()} kcal you're ~{deficit.toLocaleString()} kcal/day under TDEE
-                  {" "}({pctBWperWk.toFixed(1)}% BW/wk · {deficitPctTDEE.toFixed(0)}% of TDEE).
-                  {fatCeiling != null && (
-                    overCeiling > 0
-                      ? ` Your fat stores can supply only ~${fatCeiling.toLocaleString()} kcal/day (≈${fatMassKg.toFixed(1)} kg fat mass × ~31 kcal/lb, Alpert 2005); the ~${overCeiling.toLocaleString()} kcal/day beyond that is drawn largely from lean tissue — on the order of ~${leanLoss14.toFixed(1)} kg of lean mass over 14 days if held (rough estimate; real partitioning varies with leanness, protein and training).`
-                      : ` This still sits within what your fat stores can supply (~${fatCeiling.toLocaleString()} kcal/day from ≈${fatMassKg.toFixed(1)} kg fat mass), so most loss should be fat — provided protein and training stay high.`
-                  )}
-                  {fatCeiling == null && " Add a body-fat % in your morning log to estimate how much of this deficit your fat stores can fuel before lean tissue is tapped."}
-                  {belowBMR && ` This intake is also below your estimated BMR (~${bmr.toLocaleString()} kcal) — not sustainable beyond brief periods.`}
-                </>
+              At {activeCals.toLocaleString()} kcal you're ~{deficit.toLocaleString()} kcal/day under TDEE
+              {" "}({pctBWperWk.toFixed(1)}% BW/wk · {deficitPctTDEE.toFixed(0)}% of TDEE).
+              {fatCeiling != null && (
+                overCeiling > 0
+                  ? ` Your fat stores can supply only ~${fatCeiling.toLocaleString()} kcal/day (≈${fatMassKg.toFixed(1)} kg fat mass × ~31 kcal/lb, Alpert 2005); the ~${overCeiling.toLocaleString()} kcal/day beyond that is drawn largely from lean tissue — on the order of ~${leanLoss14.toFixed(1)} kg of lean mass over 14 days if held (rough estimate; real partitioning varies with leanness, protein and training).`
+                  : ` This still sits within what your fat stores can supply (~${fatCeiling.toLocaleString()} kcal/day from ≈${fatMassKg.toFixed(1)} kg fat mass), so most loss should be fat — provided protein and training stay high.`
               )}
+              {fatCeiling == null && " Add a body-fat % in your morning log to estimate how much of this deficit your fat stores can fuel before lean tissue is tapped."}
+              {belowBMR && ` This intake is also below your estimated BMR (~${bmr.toLocaleString()} kcal) — not sustainable beyond brief periods.`}
             </div>
             <div style={{ fontSize: 10, color: "var(--text-dim)", lineHeight: 1.5, marginTop: 6 }}>
-              {phase === "bulk"
-                ? `Evidence (Helms 2014; Slater & Phillips 2011) suggests ${magnitude === "conservative" ? "0.1–0.25" : magnitude === "moderate" ? "0.25–0.5" : "0.5–1.0"}% BW/wk maximises muscle:fat ratio. Keep protein at ≥1.8 g/kg and resistance training consistent.`
-                : `Evidence (Garthe 2011; Helms 2014) favours ~0.5–1% BW/wk to retain muscle and strength. If you go this low, keep it short, hold protein high (${phase === "cut" ? "2.2–2.4" : "≥2.0"} g/kg), and keep resistance training in.`}
+              Evidence (Garthe 2011; Helms 2014) favours ~0.5–1% BW/wk to retain muscle and strength. If you go this low, keep it short, hold protein high ({phase === "cut" ? "2.2–2.4" : "≥2.0"} g/kg), and keep resistance training in.
             </div>
           </div>
         )}
         {riskLevel === "none" && deficit > 0 && (
           <div style={{ marginTop: 10, fontSize: 10, color: "#34d399", lineHeight: 1.5 }}>
             ✓ ~{pctBWperWk.toFixed(1)}% BW/wk — within the evidence-based range for retaining lean mass (Helms 2014; Garthe 2011).
-          </div>
-        )}
-        {riskLevel === "none" && phase === "bulk" && deficit <= 0 && (
-          <div style={{ marginTop: 10, fontSize: 10, color: "#34d399", lineHeight: 1.5 }}>
-            ✓ ~{pctBWperWk.toFixed(1)}% BW/wk — within the {magInfo?.label ?? magnitude} bulk range. Good muscle:fat ratio expected at this rate.
           </div>
         )}
       </div>
@@ -3266,7 +3055,6 @@ function ReportView({ reportRange, setReportRange, reportCustomStart, setReportC
       )}
 
       {/* Insights */}
-
       <div style={{ fontSize: 10, letterSpacing: "0.12em", textTransform: "uppercase", color: "var(--text-dim)", fontWeight: 600, marginBottom: 12 }}>Insights &amp; Recommendations</div>
       <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 12 }}>
         {r.insights.map((ins, i) => {
