@@ -8,6 +8,7 @@ const CYCLE_KEY = "body-tracker-cycle";
 const GOAL_KEY = "body-tracker-goal";
 const PHASEHIST_KEY = "body-tracker-phasehist";
 const THEME_KEY = "body-tracker-theme";
+const WATER_KEY = "body-tracker-water";
 
 // Structural color tokens. Accent colors (phase/macro) are left as literal hex
 // since they read well on both themes.
@@ -460,6 +461,7 @@ export default function App() {
   const [goal, setGoal] = useState(null);
   const [goalOpen, setGoalOpen] = useState(false);
   const [reviewConfirming, setReviewConfirming] = useState(false);
+  const [waterLog, setWaterLog] = useState({}); // { [date]: { plain: ml, carbMix: ml, gymDay: bool } }
   // Phase history: array of { date, phase, magnitude }
   const [phaseHist, setPhaseHist] = useState([]);
   const fileInputRef = useRef(null);
@@ -485,6 +487,8 @@ export default function App() {
       if (ph) setPhaseHist(ph);
       const t = store.get(THEME_KEY);
       if (t === "light" || t === "dark") setTheme(t);
+      const wl = store.get(WATER_KEY);
+      if (wl) setWaterLog(wl);
     } catch (_) {}
     setLoaded(true);
   }, []);
@@ -537,6 +541,19 @@ export default function App() {
   const saveGoal = (next) => {
     setGoal(next);
     store.set(GOAL_KEY, next);
+  };
+  const saveWater = (next) => { setWaterLog(next); store.set(WATER_KEY, next); };
+  const addWaterAmount = (date, field, ml) => {
+    const day = waterLog[date] || { plain: 0, carbMix: 0, gymDay: false };
+    saveWater({ ...waterLog, [date]: { ...day, [field]: Math.max(0, (day[field] || 0) + ml) } });
+  };
+  const toggleGymDay = (date, val) => {
+    const day = waterLog[date] || { plain: 0, carbMix: 0, gymDay: false };
+    saveWater({ ...waterLog, [date]: { ...day, gymDay: val } });
+  };
+  const resetWaterDay = (date) => {
+    const day = waterLog[date] || { plain: 0, carbMix: 0, gymDay: false };
+    saveWater({ ...waterLog, [date]: { plain: 0, carbMix: 0, gymDay: day.gymDay } });
   };
 
   const savePhaseHist = (next) => {
@@ -2093,6 +2110,16 @@ export default function App() {
         </div>
 
 
+        {/* ── Hydration Tracker ── */}
+        <WaterLogger
+          date={today}
+          waterLog={waterLog}
+          latestWeight={latestWeight}
+          addWaterAmount={addWaterAmount}
+          toggleGymDay={toggleGymDay}
+          resetWaterDay={resetWaterDay}
+        />
+
         {/* ── Log Table ── */}
         {displayRows.length > 0 && (
           <div>
@@ -2171,6 +2198,141 @@ export default function App() {
     </div>
   );
 }
+
+// ── Hydration Tracker ──
+function WaterLogger({ date, waterLog, latestWeight, addWaterAmount, toggleGymDay, resetWaterDay }) {
+  const [customMl, setCustomMl] = useState("");
+  const [carbMl, setCarbMl] = useState("");
+  const [carbG, setCarbG] = useState("");
+
+  const day = waterLog[date] || { plain: 0, carbMix: 0, gymDay: false };
+  const plain = day.plain || 0;
+  const carb = day.carbMix || 0;
+  const total = plain + carb;
+
+  // Goal: 35ml/kg base + 750ml on gym days
+  const baseGoal = latestWeight ? Math.round((latestWeight * 35) / 100) * 100 : 2500;
+  const goal = baseGoal + (day.gymDay ? 750 : 0);
+  const pct = Math.min(100, Math.round((total / goal) * 100));
+  const gaugeColor = pct >= 100 ? "#34d399" : pct >= 66 ? "#60a5fa" : pct >= 33 ? "#818cf8" : "var(--border-strong)";
+
+  // Maltodextrin concentration warning: 8% max = 80g per litre
+  const maxMaltodextrin = carbMl !== "" ? Math.floor(Number(carbMl) * 0.08) : null;
+  const carbGNum = carbG !== "" ? Number(carbG) : null;
+  const concPct = carbMl !== "" && carbGNum != null ? (carbGNum / Number(carbMl)) * 100 : null;
+  const concWarning = concPct != null && concPct > 8
+    ? `Too concentrated (${concPct.toFixed(1)}%) — above 8% slows absorption. Max ${maxMaltodextrin}g for ${carbMl}ml.`
+    : concPct != null && concPct >= 6
+    ? `Good concentration (${concPct.toFixed(1)}%) — within 6–8% window ✓`
+    : concPct != null
+    ? `Dilute (${concPct.toFixed(1)}%) — fine for hydration, low carb delivery`
+    : null;
+  const concColor = concPct != null && concPct > 8 ? "#f87171" : concPct != null && concPct >= 6 ? "#34d399" : "var(--text-muted)";
+
+  const field = { background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 6, padding: "7px 10px", color: "var(--text)", fontSize: 12, outline: "none", boxSizing: "border-box" };
+  const presetBtn = { border: "1px solid var(--border)", borderRadius: 6, padding: "5px 9px", fontSize: 11, fontWeight: 600, cursor: "pointer", background: "var(--bg)", color: "var(--text-soft)" };
+
+  return (
+    <div style={{ marginTop: 24 }}>
+      <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--text-muted)", marginBottom: 10 }}>Hydration</div>
+      <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10, padding: "14px" }}>
+        {/* Goal + gym day */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+          <div style={{ fontSize: 11, color: "var(--text-soft)" }}>
+            Goal: <strong style={{ color: "var(--text)" }}>{(goal / 1000).toFixed(1)}L</strong>
+            <span style={{ color: "var(--text-dim)", marginLeft: 4 }}>({(baseGoal / 1000).toFixed(1)}L base{day.gymDay ? " + 0.75L gym" : ""})</span>
+          </div>
+          <label style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer", fontSize: 11, color: "var(--text-soft)" }}>
+            <input type="checkbox" checked={day.gymDay} onChange={e => toggleGymDay(date, e.target.checked)}
+              style={{ accentColor: "#6366f1", width: 13, height: 13 }} />
+            Gym day
+          </label>
+        </div>
+        {/* Gauge */}
+        <div style={{ marginBottom: 12 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 5 }}>
+            <span style={{ fontSize: 22, fontWeight: 800, color: pct >= 100 ? "#34d399" : "var(--text)", lineHeight: 1 }}>
+              {(total / 1000).toFixed(2)}L
+            </span>
+            <span style={{ fontSize: 11, color: "var(--text-muted)" }}>{pct}% of goal</span>
+          </div>
+          <div style={{ height: 10, borderRadius: 999, background: "var(--bg)", overflow: "hidden", border: "1px solid var(--border)" }}>
+            <div style={{ height: "100%", width: `${pct}%`, background: gaugeColor, borderRadius: 999, transition: "width 300ms ease" }} />
+          </div>
+          {pct >= 100 && <div style={{ fontSize: 10, color: "#34d399", marginTop: 4, textAlign: "center" }}>✓ Goal reached</div>}
+          {(plain > 0 || carb > 0) && (
+            <div style={{ display: "flex", gap: 12, marginTop: 6 }}>
+              {plain > 0 && <span style={{ fontSize: 10, color: "var(--text-muted)" }}>💧 Water: <strong style={{ color: "var(--text)" }}>{(plain / 1000).toFixed(2)}L</strong></span>}
+              {carb > 0 && <span style={{ fontSize: 10, color: "var(--text-muted)" }}>🟡 Carb mix: <strong style={{ color: "#f59e0b" }}>{(carb / 1000).toFixed(2)}L</strong></span>}
+            </div>
+          )}
+        </div>
+        {/* Water presets */}
+        <div style={{ fontSize: 9, color: "var(--text-muted)", fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 6 }}>Add water</div>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
+          {[150, 250, 330, 500, 750].map(ml => (
+            <button key={ml} onClick={() => addWaterAmount(date, "plain", ml)} style={presetBtn}>{ml}ml</button>
+          ))}
+        </div>
+        <div style={{ display: "flex", gap: 6, marginBottom: 16 }}>
+          <input type="number" inputMode="decimal" value={customMl} onChange={e => setCustomMl(e.target.value)}
+            placeholder="Custom ml" style={{ ...field, flex: 1 }} />
+          <button onClick={() => { if (customMl !== "") { addWaterAmount(date, "plain", Number(customMl)); setCustomMl(""); } }}
+            style={{ ...presetBtn, background: "#6366f1", color: "#fff", border: "none", padding: "7px 14px" }}>Add</button>
+        </div>
+        {/* Carb mix section */}
+        <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12 }}>
+          <div style={{ fontSize: 9, color: "var(--text-muted)", fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 4 }}>
+            Carb mix (maltodextrin + water)
+          </div>
+          <div style={{ fontSize: 10, color: "var(--text-dim)", marginBottom: 8, lineHeight: 1.5 }}>
+            Mix at 6–8% for full hydration credit. Counts toward your daily goal when correctly diluted.
+          </div>
+          <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 9, color: "var(--text-muted)", marginBottom: 3 }}>Volume (ml)</div>
+              <input type="number" inputMode="decimal" value={carbMl} onChange={e => setCarbMl(e.target.value)}
+                placeholder="e.g. 500" style={{ ...field, width: "100%" }} />
+            </div>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 9, color: "var(--text-muted)", marginBottom: 3 }}>
+                Maltodextrin (g) {carbMl !== "" ? `· max ${Math.floor(Number(carbMl) * 0.08)}g` : ""}
+              </div>
+              <input type="number" inputMode="decimal" value={carbG} onChange={e => setCarbG(e.target.value)}
+                placeholder="e.g. 35" style={{ ...field, width: "100%", borderColor: concPct != null && concPct > 8 ? "#f87171" : "var(--border)" }} />
+            </div>
+          </div>
+          {concWarning && (
+            <div style={{ fontSize: 10, color: concColor, marginBottom: 8, lineHeight: 1.4 }}>{concWarning}</div>
+          )}
+          <button
+            disabled={carbMl === "" || (concPct != null && concPct > 8)}
+            onClick={() => {
+              if (carbMl !== "" && (concPct == null || concPct <= 8)) {
+                addWaterAmount(date, "carbMix", Number(carbMl));
+                setCarbMl(""); setCarbG("");
+              }
+            }}
+            style={{ ...presetBtn, background: (carbMl === "" || (concPct != null && concPct > 8)) ? "var(--border)" : "#f59e0b", color: (carbMl === "" || (concPct != null && concPct > 8)) ? "var(--text-dim)" : "#fff", border: "none", padding: "7px 16px", cursor: (carbMl === "" || (concPct != null && concPct > 8)) ? "default" : "pointer" }}>
+            Log carb mix
+          </button>
+          {carb > 0 && (
+            <span style={{ fontSize: 10, color: "var(--text-muted)", marginLeft: 10 }}>
+              Today: {(carb / 1000).toFixed(2)}L logged
+            </span>
+          )}
+        </div>
+        {/* Reset */}
+        {(plain > 0 || carb > 0) && (
+          <button onClick={() => resetWaterDay(date)} style={{ marginTop: 12, background: "none", border: "none", color: "var(--text-faint)", fontSize: 10, cursor: "pointer", textDecoration: "underline" }}>
+            Reset today
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 
 function TrendsView({ range, setRange, metric, setMetric, chartWithTrend, metricRows, metricCfg, totalChange, weeklyChange, theme, overlayData, phaseMarkers }) {
   // Recharts renders SVG attributes that don't resolve CSS var(), so use literal colors.
