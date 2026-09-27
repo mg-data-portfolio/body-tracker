@@ -2508,7 +2508,7 @@ function DietBreakBanner({ dietBreak, weeksCutting, showRec, phase, maintenanceT
 
 // ── Refeed Recommendation ──
 function RefeedRecommendation({ phase, today, nextRefeedBase, refeedDays, maintenanceTarget, onSchedule, onRemove }) {
-  const [offset, setOffset] = React.useState(0);
+  const [offset, setOffset] = useState(0);
   if (phase !== "cut") return null;
   const isRefeedToday = refeedDays[today] === true;
   // Find upcoming scheduled refeeds
