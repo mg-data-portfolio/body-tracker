@@ -9,6 +9,7 @@ const GOAL_KEY = "body-tracker-goal";
 const PHASEHIST_KEY = "body-tracker-phasehist";
 const THEME_KEY = "body-tracker-theme";
 const WATER_KEY = "body-tracker-water";
+const DIETBREAK_KEY = "body-tracker-diet-break";
 
 // Structural color tokens. Accent colors (phase/macro) are left as literal hex
 // since they read well on both themes.
@@ -461,7 +462,8 @@ export default function App() {
   const [goal, setGoal] = useState(null);
   const [goalOpen, setGoalOpen] = useState(false);
   const [reviewConfirming, setReviewConfirming] = useState(false);
-  const [waterLog, setWaterLog] = useState({}); // { [date]: { plain: ml, carbMix: ml, gymDay: bool } }
+  const [waterLog, setWaterLog] = useState({}); // { [date]: { plain: ml, carbMix: ml, gymDay: bool, lastAction: {field,amount}|null } }
+  const [dietBreakMode, setDietBreakMode] = useState(null); // { active: bool, startDate: string }
   // Phase history: array of { date, phase, magnitude }
   const [phaseHist, setPhaseHist] = useState([]);
   const fileInputRef = useRef(null);
@@ -489,6 +491,8 @@ export default function App() {
       if (t === "light" || t === "dark") setTheme(t);
       const wl = store.get(WATER_KEY);
       if (wl) setWaterLog(wl);
+      const db = store.get(DIETBREAK_KEY);
+      if (db) setDietBreakMode(db);
     } catch (_) {}
     setLoaded(true);
   }, []);
@@ -545,16 +549,19 @@ export default function App() {
   const saveWater = (next) => { setWaterLog(next); store.set(WATER_KEY, next); };
   const addWaterAmount = (date, field, ml) => {
     const day = waterLog[date] || { plain: 0, carbMix: 0, gymDay: false };
-    saveWater({ ...waterLog, [date]: { ...day, [field]: Math.max(0, (day[field] || 0) + ml) } });
+    saveWater({ ...waterLog, [date]: { ...day, [field]: Math.max(0, (day[field] || 0) + ml), lastAction: { field, amount: ml } } });
+  };
+  const undoLastWater = (date) => {
+    const day = waterLog[date];
+    if (!day?.lastAction) return;
+    const { field, amount } = day.lastAction;
+    saveWater({ ...waterLog, [date]: { ...day, [field]: Math.max(0, (day[field] || 0) - amount), lastAction: null } });
   };
   const toggleGymDay = (date, val) => {
     const day = waterLog[date] || { plain: 0, carbMix: 0, gymDay: false };
     saveWater({ ...waterLog, [date]: { ...day, gymDay: val } });
   };
-  const resetWaterDay = (date) => {
-    const day = waterLog[date] || { plain: 0, carbMix: 0, gymDay: false };
-    saveWater({ ...waterLog, [date]: { plain: 0, carbMix: 0, gymDay: day.gymDay } });
-  };
+  const saveDietBreak = (next) => { setDietBreakMode(next); store.set(DIETBREAK_KEY, next); };
 
   const savePhaseHist = (next) => {
     setPhaseHist(next);
@@ -742,7 +749,9 @@ export default function App() {
   // - Review is just a proposal — doesn't affect daily target until Apply is clicked
   // - If no cycle: use formula target
   // The ONLY ways to change target are: (1) change phase/magnitude, or (2) click Apply on review
-  const target = (cycle && cycle.lockedTarget != null) ? cycle.lockedTarget : formulaTarget;
+  const baseTarget = (cycle && cycle.lockedTarget != null) ? cycle.lockedTarget : formulaTarget;
+  const maintenanceTarget = effectiveTDEE ? Math.round(effectiveTDEE / 25) * 25 : baseTarget;
+  const target = dietBreakMode?.active ? maintenanceTarget : baseTarget;
 
   // Compute the review proposal when due
   let review = null;
@@ -2117,8 +2126,37 @@ export default function App() {
           latestWeight={latestWeight}
           addWaterAmount={addWaterAmount}
           toggleGymDay={toggleGymDay}
-          resetWaterDay={resetWaterDay}
+          undoLastWater={undoLastWater}
         />
+
+        {/* ── Diet Break / Deload ── */}
+        <div style={{ marginBottom: 24 }}>
+          {dietBreakMode?.active ? (
+            <div style={{ background: "#34d39912", border: "1px solid #34d39940", borderRadius: 10, padding: "14px" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                <span style={{ fontSize: 11, fontWeight: 700, color: "#34d399" }}>
+                  🌿 Diet break / deload — Day {Math.floor((new Date(today + "T00:00:00") - new Date(dietBreakMode.startDate + "T00:00:00")) / 86400000) + 1}
+                </span>
+                <span style={{ fontSize: 10, color: "var(--text-muted)" }}>{maintenanceTarget?.toLocaleString()} kcal</span>
+              </div>
+              <div style={{ fontSize: 10, color: "var(--text-soft)", lineHeight: 1.5, marginBottom: 10 }}>
+                Target set to maintenance. Eat at maintenance, reduce training intensity — hormones stabilise over 1–2 weeks.
+              </div>
+              <button onClick={() => saveDietBreak(null)}
+                style={{ background: "transparent", color: "var(--text-muted)", border: "1px solid var(--border)", borderRadius: 6, padding: "6px 14px", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
+                End diet break
+              </button>
+            </div>
+          ) : (
+            <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", padding: "10px 0" }}>
+              <input type="checkbox" onChange={e => { if (e.target.checked) saveDietBreak({ active: true, startDate: today }); }}
+                style={{ accentColor: "#34d399", width: 15, height: 15 }} />
+              <span style={{ fontSize: 12, color: "var(--text-soft)" }}>
+                Deload / diet break — switch to maintenance calories
+              </span>
+            </label>
+          )}
+        </div>
 
         {/* ── Log Table ── */}
         {displayRows.length > 0 && (
@@ -2200,7 +2238,7 @@ export default function App() {
 }
 
 // ── Hydration Tracker ──
-function WaterLogger({ date, waterLog, latestWeight, addWaterAmount, toggleGymDay, resetWaterDay }) {
+function WaterLogger({ date, waterLog, latestWeight, addWaterAmount, toggleGymDay, undoLastWater }) {
   const [customMl, setCustomMl] = useState("");
   const [carbMl, setCarbMl] = useState("");
   const [carbG, setCarbG] = useState("");
@@ -2233,7 +2271,7 @@ function WaterLogger({ date, waterLog, latestWeight, addWaterAmount, toggleGymDa
   const presetBtn = { border: "1px solid var(--border)", borderRadius: 6, padding: "5px 9px", fontSize: 11, fontWeight: 600, cursor: "pointer", background: "var(--bg)", color: "var(--text-soft)" };
 
   return (
-    <div style={{ marginTop: 24 }}>
+    <div style={{ marginTop: 24, marginBottom: 28 }}>
       <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--text-muted)", marginBottom: 10 }}>Hydration</div>
       <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10, padding: "14px" }}>
         {/* Goal + gym day */}
@@ -2322,10 +2360,10 @@ function WaterLogger({ date, waterLog, latestWeight, addWaterAmount, toggleGymDa
             </span>
           )}
         </div>
-        {/* Reset */}
-        {(plain > 0 || carb > 0) && (
-          <button onClick={() => resetWaterDay(date)} style={{ marginTop: 12, background: "none", border: "none", color: "var(--text-faint)", fontSize: 10, cursor: "pointer", textDecoration: "underline" }}>
-            Reset today
+        {/* Undo last entry */}
+        {day.lastAction && (
+          <button onClick={() => undoLastWater(date)} style={{ marginTop: 12, background: "none", border: "none", color: "var(--text-muted)", fontSize: 11, cursor: "pointer", display: "flex", alignItems: "center", gap: 4 }}>
+            ↩ Undo last ({day.lastAction.field === "plain" ? "water" : "carb mix"} {day.lastAction.amount}ml)
           </button>
         )}
       </div>
