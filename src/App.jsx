@@ -1043,6 +1043,14 @@ export default function App() {
 
   const reportData = buildReport(reportStart, reportEnd);
 
+  // ── Month comparison data ──
+  const now = new Date();
+  const thisMonthStart = formatDate(new Date(now.getFullYear(), now.getMonth(), 1));
+  const lastMonthStart = formatDate(new Date(now.getFullYear(), now.getMonth() - 1, 1));
+  const lastMonthEnd = formatDate(new Date(now.getFullYear(), now.getMonth(), 0));
+  const compThis = buildReport(thisMonthStart, today);
+  const compLast = buildReport(lastMonthStart, lastMonthEnd);
+
   // Auto-start a cycle once we have a real target and none is running
   useEffect(() => {
     if (!loaded) return;
@@ -1635,6 +1643,8 @@ export default function App() {
             onExportMD={() => exportReportMD(reportData)}
             onCopyMD={() => copyReportMD(reportData)}
             onExportPDF={() => exportReportPDF(reportData)}
+            compThis={compThis}
+            compLast={compLast}
           />
         )}
         {view === "log" && (
@@ -3109,7 +3119,7 @@ function ConfirmDialog({ title, message, actions, onClose }) {
   );
 }
 
-function ReportView({ reportRange, setReportRange, reportCustomStart, setReportCustomStart, reportCustomEnd, setReportCustomEnd, reportData, onExportMD, onCopyMD, onExportPDF }) {
+function ReportView({ reportRange, setReportRange, reportCustomStart, setReportCustomStart, reportCustomEnd, setReportCustomEnd, reportData, onExportMD, onCopyMD, onExportPDF, compThis, compLast }) {
   const r = reportData;
   const fmt1 = (v) => v != null ? v.toFixed(1) : "—";
   const fmt2 = (v) => v != null ? v.toFixed(2) : "—";
@@ -3255,6 +3265,68 @@ function ReportView({ reportRange, setReportRange, reportCustomStart, setReportC
       )}
 
       {/* Insights */}
+      {/* ── Month Comparison ── */}
+      {compThis && compLast && (
+        <div style={{ marginBottom: 24 }}>
+          <div style={{ fontSize: 10, letterSpacing: "0.12em", textTransform: "uppercase", color: "var(--text-dim)", fontWeight: 600, marginBottom: 12 }}>Month Comparison</div>
+          <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10, overflow: "hidden" }}>
+            {/* Header */}
+            <div style={{ display: "grid", gridTemplateColumns: "1.5fr 1fr 1fr", background: "var(--bg)", borderBottom: "1px solid var(--border)", padding: "8px 12px" }}>
+              <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: "var(--text-dim)" }}>Metric</div>
+              <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: "var(--text-dim)", textAlign: "center" }}>
+                {new Date(new Date().getFullYear(), new Date().getMonth() - 1, 1).toLocaleString("default", { month: "short" })}
+              </div>
+              <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: "#a5b4fc", textAlign: "center" }}>
+                {new Date().toLocaleString("default", { month: "short" })} (so far)
+              </div>
+            </div>
+            {[
+              {
+                label: "Weight change",
+                lastVal: compLast.startWeight != null && compLast.endWeight != null ? `${(compLast.endWeight - compLast.startWeight) >= 0 ? "+" : ""}${(compLast.endWeight - compLast.startWeight).toFixed(1)} kg` : "—",
+                currVal: compThis.startWeight != null && compThis.endWeight != null ? `${(compThis.endWeight - compThis.startWeight) >= 0 ? "+" : ""}${(compThis.endWeight - compThis.startWeight).toFixed(1)} kg` : "—",
+              },
+              {
+                label: "BF% change",
+                lastVal: compLast.bfChange != null ? `${compLast.bfChange >= 0 ? "+" : ""}${compLast.bfChange.toFixed(1)} pts` : "—",
+                currVal: compThis.bfChange != null ? `${compThis.bfChange >= 0 ? "+" : ""}${compThis.bfChange.toFixed(1)} pts` : "—",
+              },
+              {
+                label: "Avg calories",
+                lastVal: compLast.avgCalories != null ? `${Math.round(compLast.avgCalories).toLocaleString()} kcal` : "—",
+                currVal: compThis.avgCalories != null ? `${Math.round(compThis.avgCalories).toLocaleString()} kcal` : "—",
+              },
+              {
+                label: "Avg protein",
+                lastVal: compLast.avgProtein != null ? `${Math.round(compLast.avgProtein)} g` : "—",
+                currVal: compThis.avgProtein != null ? `${Math.round(compThis.avgProtein)} g` : "—",
+              },
+              {
+                label: "Calorie adherence",
+                lastVal: compLast.targetComparable > 0 ? `${Math.round((compLast.onTargetDays / compLast.targetComparable) * 100)}%` : "—",
+                currVal: compThis.targetComparable > 0 ? `${Math.round((compThis.onTargetDays / compThis.targetComparable) * 100)}%` : "—",
+              },
+              {
+                label: "Protein target hit",
+                lastVal: compLast.proteinTracked > 0 ? `${Math.round((compLast.proteinHitDays / compLast.proteinTracked) * 100)}%` : "—",
+                currVal: compThis.proteinTracked > 0 ? `${Math.round((compThis.proteinHitDays / compThis.proteinTracked) * 100)}%` : "—",
+              },
+              {
+                label: "Days logged",
+                lastVal: compLast.entryCount != null ? `${compLast.entryCount}` : "—",
+                currVal: compThis.entryCount != null ? `${compThis.entryCount}` : "—",
+              },
+            ].map((row, idx) => (
+              <div key={idx} style={{ display: "grid", gridTemplateColumns: "1.5fr 1fr 1fr", padding: "10px 12px", borderBottom: "1px solid var(--border)" }}>
+                <div style={{ fontSize: 11, color: "var(--text-soft)" }}>{row.label}</div>
+                <div style={{ fontSize: 12, fontWeight: 600, color: "var(--text-muted)", textAlign: "center" }}>{row.lastVal}</div>
+                <div style={{ fontSize: 12, fontWeight: 700, color: "#a5b4fc", textAlign: "center" }}>{row.currVal}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div style={{ fontSize: 10, letterSpacing: "0.12em", textTransform: "uppercase", color: "var(--text-dim)", fontWeight: 600, marginBottom: 12 }}>Insights &amp; Recommendations</div>
       <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 12 }}>
         {r.insights.map((ins, i) => {
