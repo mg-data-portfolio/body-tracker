@@ -865,9 +865,9 @@ export default function App() {
   };
   const historicalTargetCache = {};
   const targetForDate = (dateStr) => {
-    // Always use the current locked target for vs-target calculations
-    // This ensures log rows are consistent with the daily target display
-    // Historical formula targets are unreliable as TDEE changes over time
+    // Only show vs-target for dates within the current cycle
+    // Dates before the anchor were under a different target — show nothing
+    if (!cycle?.anchorDate || dateStr < cycle.anchorDate) return null;
     return target;
   };
 
@@ -898,7 +898,7 @@ export default function App() {
     const bfReg = bfPts.length >= 2 ? linReg(bfPts) : null;
     const weightChange = wReg ? wReg.slope * (wPts[wPts.length - 1].x - wPts[0].x) / 86400000 : null;
     const weightChangePerWeek = wReg ? wReg.slope * 7 * 86400000 : null;
-    const bfChange = bfReg ? bfReg.slope * (bfPts[bfPts.length - 1].x - bfPts[0].x) / 86400000 : null;
+    const bfChange = (startBf != null && endBf != null) ? endBf - startBf : null;
     const startWeight = wRows.length ? wRows[0].weight : null;
     const endWeight = wRows.length ? wRows[wRows.length - 1].weight : null;
     const startBf = bfRows.length ? bfRows[0].bf : null;
