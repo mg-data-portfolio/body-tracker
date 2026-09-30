@@ -898,11 +898,11 @@ export default function App() {
     const bfReg = bfPts.length >= 2 ? linReg(bfPts) : null;
     const weightChange = wReg ? wReg.slope * (wPts[wPts.length - 1].x - wPts[0].x) / 86400000 : null;
     const weightChangePerWeek = wReg ? wReg.slope * 7 * 86400000 : null;
-    const bfChange = (startBf != null && endBf != null) ? endBf - startBf : null;
     const startWeight = wRows.length ? wRows[0].weight : null;
     const endWeight = wRows.length ? wRows[wRows.length - 1].weight : null;
     const startBf = bfRows.length ? bfRows[0].bf : null;
     const endBf = bfRows.length ? bfRows[bfRows.length - 1].bf : null;
+    const bfChange = (startBf != null && endBf != null) ? endBf - startBf : null;
 
     // Adherence to historical target within range
     let onTargetDays = 0, overDays = 0, underDays = 0, targetComparable = 0;
