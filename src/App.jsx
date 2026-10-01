@@ -11,6 +11,7 @@ const THEME_KEY = "body-tracker-theme";
 const WATER_KEY = "body-tracker-water";
 const DIETBREAK_KEY = "body-tracker-diet-break";
 const TDEE_KEY = "body-tracker-tdee";
+const TDEEPARAMS_KEY = "body-tracker-tdee-params";
 const DIETBREAKLOG_KEY = "body-tracker-diet-break-log";
 
 // Structural color tokens. Accent colors (phase/macro) are left as literal hex
@@ -197,6 +198,7 @@ const FLAGS = {
   NON_STANDARD_WEIGHIN: "nonStandardWeighIn", // = exclusion of that day's weight AND body fat
   CALORIES_INCOMPLETE: "caloriesIncomplete",
   OTHER: "other",
+  WEIGHT_CONFIRMED: "weightConfirmed", // internal: user confirmed this reading is real, so never ask again
 };
 
 // A day counts as a "confounder day" if it has any of these. Training/DOMS,
@@ -252,13 +254,15 @@ const isSuspect = (deviation, expected, p) =>
 // all the OTHER weights still in the set. The single worst offender is flagged, removed, and
 // the rest are re-checked against the re-fitted line — so one spike can't make its normal-
 // looking neighbours look odd. points: [{date, weight}]
-function detectSuspectWeights(points, params = {}) {
+function detectSuspectWeights(points, params = {}, skipDates = []) {
   const p = { ...TDEE_DEFAULTS, ...params };
+  const skip = new Set(skipDates); // confirmed-normal days: stay in the fit, are never flagged
   let pool = points.slice();
   const out = [];
   while (pool.length >= p.suspectMinPoints) {
     let worst = null;
     for (let i = 0; i < pool.length; i++) {
+      if (skip.has(pool[i].date)) continue;
       const others = pool.filter((_, j) => j !== i).map((q) => ({ x: dayNum(q.date), y: q.weight }));
       const reg = linReg(others);
       if (!reg) continue;
@@ -449,7 +453,8 @@ function assessReview({
     proposedChange = proposedTDEE - currentTDEE;
   }
 
-  const suspectWeights = detectSuspectWeights(validDays.map((d) => ({ date: d.date, weight: d.weight })), p);
+  const confirmedDates = days.filter((d) => d.flags.includes(FLAGS.WEIGHT_CONFIRMED)).map((d) => d.date);
+  const suspectWeights = detectSuspectWeights(validDays.map((d) => ({ date: d.date, weight: d.weight })), p, confirmedDates);
 
   return {
     window: { start, end },
@@ -570,7 +575,19 @@ function csvToEntries(text) {
 }
 // ═══ TDEE REVIEW LOGIC — END ═══
 
-const KCAL_PER_KG = TDEE_DEFAULTS.kcalPerKg; // single shared energy-equivalent value
+const KCAL_PER_KG = TDEE_DEFAULTS.kcalPerKg; // default energy-equivalent value (configurable in Profile)
+const FLAG_OPTIONS = [
+  { id: FLAGS.HIGH_CARB_SODIUM, label: "High carb / sodium" },
+  { id: FLAGS.ALCOHOL, label: "Alcohol" },
+  { id: FLAGS.HARD_TRAINING, label: "Hard training / DOMS" },
+  { id: FLAGS.TRAVEL, label: "Travel / disrupted routine" },
+  { id: FLAGS.DIGESTIVE, label: "Digestive issue" },
+  { id: FLAGS.ILLNESS, label: "Illness / injury" },
+  { id: FLAGS.CREATINE, label: "Creatine change" },
+  { id: FLAGS.ACTIVITY_CHANGED, label: "Activity changed" },
+  { id: FLAGS.CALORIES_INCOMPLETE, label: "Calories incomplete" },
+  { id: FLAGS.OTHER, label: "Other" },
+];
 
 function parseEntry(e) {
   return {
@@ -584,7 +601,7 @@ function parseEntry(e) {
 // TDEE via regression of weight-change rate over a window of N days.
 // Returns { tdee, days, weightPoints, caloriePoints } or null.
 // dated: array of { date, ts, calories, weight } sorted ascending.
-function calcTDEEWindow(dated, windowDays, asOfTs = Date.now()) {
+function calcTDEEWindow(dated, windowDays, asOfTs = Date.now(), kcalPerKg = KCAL_PER_KG) {
   const cutoff = asOfTs - windowDays * 86400000;
   const win = dated.filter(d => d.ts >= cutoff && d.ts <= asOfTs);
   const cals = win.map(d => d.calories).filter(v => v != null);
@@ -597,7 +614,7 @@ function calcTDEEWindow(dated, windowDays, asOfTs = Date.now()) {
   if (!reg) return null;
   const avgCals = avg(cals);
   const dailyKgChange = reg.slope * 86400000; // slope is kg per ms
-  const dailySurplus = dailyKgChange * KCAL_PER_KG;  // kcal/day implied by weight trend
+  const dailySurplus = dailyKgChange * kcalPerKg;  // kcal/day implied by weight trend
   return {
     tdee: Math.round(avgCals - dailySurplus),
     days: Math.round(spanDays),
@@ -894,6 +911,9 @@ export default function App() {
   const [tdeeState, setTdeeState] = useState(null);
   const [dietBreakLog, setDietBreakLog] = useState([]); // [{ start, end|null }]
   const [morningExcludeEdit, setMorningExcludeEdit] = useState(null); // null = follow saved flag
+  const [tdeeParams, setTdeeParams] = useState({ cap: TDEE_DEFAULTS.cap, kcalPerKg: TDEE_DEFAULTS.kcalPerKg });
+  const [previewTdee, setPreviewTdee] = useState(false);
+  const [flagsOpen, setFlagsOpen] = useState(false);
   const fileInputRef = useRef(null);
   const dateInputRef = useRef(null);
 
@@ -925,6 +945,8 @@ export default function App() {
       if (ts) setTdeeState(ts);
       const dbl = store.get(DIETBREAKLOG_KEY);
       if (Array.isArray(dbl)) setDietBreakLog(dbl);
+      const tpar = store.get(TDEEPARAMS_KEY);
+      if (tpar) setTdeeParams({ cap: tpar.cap ?? TDEE_DEFAULTS.cap, kcalPerKg: tpar.kcalPerKg ?? TDEE_DEFAULTS.kcalPerKg });
     } catch (_) {}
     setLoaded(true);
   }, []);
@@ -995,6 +1017,7 @@ export default function App() {
   };
   const saveDietBreak = (next) => { setDietBreakMode(next); store.set(DIETBREAK_KEY, next); };
   const saveTdeeState = (next) => { setTdeeState(next); store.set(TDEE_KEY, next); };
+  const saveTdeeParams = (next) => { setTdeeParams(next); store.set(TDEEPARAMS_KEY, next); };
   const saveDietBreakLog = (next) => { setDietBreakLog(next); store.set(DIETBREAKLOG_KEY, next); };
   const startDietBreak = () => {
     saveDietBreak({ active: true, startDate: today });
@@ -1038,9 +1061,12 @@ export default function App() {
     if (!Object.keys(clean).length && opts.exclude === undefined) return false;
     const prev = entries[activeDate] || {};
     const entry = { ...prev, ...clean };
-    if (opts.exclude !== undefined) {
+    if (opts.exclude !== undefined || opts.confirm || "weight" in clean) {
       const set = new Set(prev.flags || []);
-      if (opts.exclude) set.add(FLAGS.NON_STANDARD_WEIGHIN); else set.delete(FLAGS.NON_STANDARD_WEIGHIN);
+      if ("weight" in clean) set.delete(FLAGS.WEIGHT_CONFIRMED); // a new reading needs its own confirmation
+      if (opts.confirm) set.add(FLAGS.WEIGHT_CONFIRMED);
+      if (opts.exclude === true) set.add(FLAGS.NON_STANDARD_WEIGHIN);
+      else if (opts.exclude === false) set.delete(FLAGS.NON_STANDARD_WEIGHIN);
       if (set.size) entry.flags = [...set]; else delete entry.flags;
     }
     const next = { ...entries, [activeDate]: entry };
@@ -1051,8 +1077,8 @@ export default function App() {
 
   const handleSaveMorning = async () => {
     const flagPatch = morningExclude !== savedExclude ? morningExclude : undefined;
-    const commit = async (exclude) => {
-      const ok = await saveFields({ weight: morningForm.weight, bf: morningForm.bf }, { exclude });
+    const commit = async (exclude, confirm) => {
+      const ok = await saveFields({ weight: morningForm.weight, bf: morningForm.bf }, { exclude, confirm });
       if (ok) { setMorningForm({ weight: "", bf: "" }); setMorningExcludeEdit(null); }
     };
     // Unusual against the recent trend? Offer to exclude it (unless it is already being excluded).
@@ -1065,7 +1091,7 @@ export default function App() {
           message: `${sign}${odd.deviation.toFixed(1)} kg from your recent trend (about ${odd.expected.toFixed(1)} kg expected). That is a bigger swing than usual — often water, sodium, or a different scale/time. Exclude it from your trend, TDEE and averages? It stays in your log either way.`,
           actions: [
             { label: "Save & exclude", style: "primary", onClick: async () => { setDialog(null); await commit(true); } },
-            { label: "Save anyway", style: "ghost", onClick: async () => { setDialog(null); await commit(flagPatch); } },
+            { label: "Save anyway", style: "ghost", onClick: async () => { setDialog(null); await commit(flagPatch, true); } },
             { label: "Let me fix it", style: "ghost", onClick: () => setDialog(null) },
           ],
         });
@@ -1579,7 +1605,89 @@ export default function App() {
     showToast("Holding current target");
   };
 
+  // ── TDEE review ──
+  const tdeeEngine = { cap: tdeeParams.cap, kcalPerKg: tdeeParams.kcalPerKg };
+  const tdeeSched = tdeeState ? reviewSchedule({ lastEventDate: tdeeState.lastEventDate, snoozedUntil: tdeeState.snoozedUntil, today }) : null;
+  const tdeeDue = tdeeSched?.status === "due";
+  const tdeeAssessment = (tdeeState && (tdeeDue || previewTdee))
+    ? assessReview({
+        entries, today, currentTDEE: tdeeState.currentTDEE, phaseHist, dietBreakLog,
+        isFirstReview: !(tdeeState.history || []).some(h => h.decision === "accept"),
+        priorLargeGapStreak: tdeeState.largeGapStreak || 0,
+        windowFloor: tdeeDue ? tdeeState.lastEventDate : null, // a review never reuses days before the last decision
+        params: tdeeEngine,
+      })
+    : null;
+  const tdeeRechecking = tdeeDue && tdeeAssessment?.confidence === "red";
+  const reviewAttention = !!review || (tdeeDue && tdeeAssessment != null && tdeeAssessment.confidence !== "red");
+  const targetIfAccepted = tdeeAssessment?.proposedTDEE != null ? calcTarget(tdeeAssessment.proposedTDEE, phase, magnitude) : null;
+
+  const updateDayFlags = async (date, patch) => {
+    const prev = entries[date] || {};
+    const set = new Set(prev.flags || []);
+    Object.entries(patch).forEach(([k, v]) => { if (v) set.add(k); else set.delete(k); });
+    const entry = { ...prev };
+    if (set.size) entry.flags = [...set]; else delete entry.flags;
+    const next = { ...entries, [date]: entry };
+    setEntries(next);
+    await persist(next);
+  };
+
+  const acceptTdee = () => {
+    if (!tdeeState || !tdeeAssessment?.canAccept) return;
+    const nextState = applyDecision(tdeeState, "accept", tdeeAssessment, today);
+    saveTdeeState(nextState);
+    // A new TDEE re-derives the daily target for the current phase (same formula as a phase change),
+    // and restarts the 2-week calorie review so the two reviews never adjust the same period twice.
+    const nt = calcTarget(nextState.currentTDEE, phase, magnitude);
+    if (nt != null) saveCycle({ anchorDate: today, lockedTarget: nt, syncedPhaseDate: latestPhaseChangeDate ?? cycle?.syncedPhaseDate ?? today });
+    setPreviewTdee(false);
+    showToast(`TDEE → ${nextState.currentTDEE.toLocaleString()} kcal${nt != null ? ` · target ${nt.toLocaleString()}` : ""}`);
+  };
+  const confirmAcceptTdee = () => {
+    const a = tdeeAssessment;
+    if (!a?.canAccept) return;
+    setDialog({
+      title: "Update your TDEE?",
+      message: `TDEE ${a.currentTDEE.toLocaleString()} → ${a.proposedTDEE.toLocaleString()} kcal (${a.proposedChange >= 0 ? "+" : ""}${a.proposedChange}).\n`
+        + (targetIfAccepted != null ? `Your daily target is recalculated for your current phase: ${(baseTarget ?? 0).toLocaleString()} → ${targetIfAccepted.toLocaleString()} kcal.\n` : "")
+        + "Your 2-week calorie review window restarts today.",
+      actions: [
+        { label: "Update TDEE", style: "primary", onClick: () => { setDialog(null); acceptTdee(); } },
+        { label: "Cancel", style: "ghost", onClick: () => setDialog(null) },
+      ],
+    });
+  };
+  const keepTdee = () => {
+    if (!tdeeState || !tdeeAssessment) return;
+    saveTdeeState(applyDecision(tdeeState, "keep", tdeeAssessment, today));
+    setPreviewTdee(false);
+    showToast("TDEE kept — next review in 14 days");
+  };
+  const deferTdee = () => {
+    if (!tdeeState || !tdeeAssessment) return;
+    saveTdeeState(applyDecision(tdeeState, "defer", tdeeAssessment, today));
+    showToast("Review snoozed for 7 days");
+  };
+  const explainTraffic = () => setDialog({
+    title: "How reliable is this review?",
+    message: "Green — Reliable\nEnough consistent data is available to consider updating your TDEE.\n\n"
+      + "Amber — Uncertain\nThere is enough data to estimate TDEE, but some factors make the result less reliable. Keeping your current TDEE for another review may be appropriate.\n\n"
+      + "Red — Insufficient data\nThe available data is not reliable enough to change your TDEE yet.",
+    actions: [{ label: "Got it", style: "ghost", onClick: () => setDialog(null) }],
+  });
+
+  // Clean data but raw TDEE is >500 kcal from current: record it as a kept review so a repeat can unlock the escape route.
+  useEffect(() => {
+    if (!loaded || !tdeeState || !tdeeAssessment || !tdeeDue) return;
+    if (tdeeAssessment.confidence === "red" && tdeeAssessment.gapOnlyRed) {
+      saveTdeeState(applyDecision(tdeeState, "auto_keep", tdeeAssessment, today));
+      showToast("Review done — your data is reliable but raw TDEE is far from your current TDEE. Kept for now.");
+    }
+  }, [loaded, tdeeDue, tdeeAssessment?.confidence, tdeeAssessment?.gapOnlyRed]);
+
   const activeEntry = entries[activeDate] || {};
+  const dayHasData = activeEntry.weight != null || activeEntry.bf != null || activeEntry.calories != null || activeEntry.protein != null;
   const isToday = activeDate === today;
   const morningLogged = activeEntry.weight != null || activeEntry.bf != null;
   const morningFlagChanged = morningExclude !== savedExclude;
@@ -1654,7 +1762,7 @@ export default function App() {
   const buildCSV = () => entriesToCSV(entries);
 
   const buildJSON = () => JSON.stringify(
-    { exported: new Date().toISOString(), phase, magnitude, tdeeWindow, profile, cycle, goal, phaseHist, tdeeState, dietBreakLog, dietBreakMode, waterLog, entries },
+    { exported: new Date().toISOString(), phase, magnitude, tdeeWindow, profile, cycle, goal, phaseHist, tdeeState, dietBreakLog, dietBreakMode, waterLog, tdeeParams, entries },
     null, 2
   );
 
@@ -1839,7 +1947,7 @@ export default function App() {
       try {
         const parsed = JSON.parse(text);
         imported = parsed.entries ?? parsed; // accept {entries,...} or bare map
-        if (parsed.phase || parsed.magnitude || parsed.tdeeWindow || parsed.profile || parsed.cycle || parsed.goal || parsed.phaseHist || parsed.tdeeState || parsed.dietBreakLog || parsed.waterLog || parsed.dietBreakMode !== undefined) settings = parsed;
+        if (parsed.phase || parsed.magnitude || parsed.tdeeWindow || parsed.profile || parsed.cycle || parsed.goal || parsed.phaseHist || parsed.tdeeState || parsed.dietBreakLog || parsed.waterLog || parsed.tdeeParams || parsed.dietBreakMode !== undefined) settings = parsed;
       } catch (_) { showToast("Invalid JSON file"); return; }
     } else {
       imported = csvToEntries(text);
@@ -1868,6 +1976,7 @@ export default function App() {
         if (Array.isArray(settings.dietBreakLog)) saveDietBreakLog(settings.dietBreakLog);
         if (settings.dietBreakMode !== undefined) saveDietBreak(settings.dietBreakMode);
         if (settings.waterLog) saveWater(settings.waterLog);
+        if (settings.tdeeParams) saveTdeeParams({ cap: settings.tdeeParams.cap ?? TDEE_DEFAULTS.cap, kcalPerKg: settings.tdeeParams.kcalPerKg ?? TDEE_DEFAULTS.kcalPerKg });
       }
       showToast(`Imported ${incomingCount} entries`);
     };
@@ -1986,7 +2095,8 @@ export default function App() {
           profile={profile}
           age={ageFromDOB(profile.dob)}
           baselineTDEE={baselineTDEE}
-          onSave={(p) => { saveProfile(p); setProfileOpen(false); showToast("Profile saved"); }}
+          tdeeParams={tdeeParams}
+          onSave={(p, tp) => { saveProfile(p); saveTdeeParams(tp); setProfileOpen(false); showToast("Profile saved"); }}
           onClose={() => setProfileOpen(false)}
         />
       )}
@@ -2034,6 +2144,7 @@ export default function App() {
             }}
           >
             {t.label}
+            {t.id === "log" && reviewAttention && <span aria-label="Review ready" style={{ display: "inline-block", width: 7, height: 7, borderRadius: 4, background: "#fbbf24", marginLeft: 6, verticalAlign: "middle" }} />}
           </button>
         ))}
       </div>
@@ -2053,13 +2164,13 @@ export default function App() {
             macros={macros} target={target} tdee={effectiveTDEE}
             phase={phase} phaseInfo={phaseInfo} magInfo={magInfo} magnitude={magnitude}
             macroWeight={macroWeight} sortedLen={sorted.length}
-            avgBf={avgBf} profile={profile}
+            avgBf={avgBf} profile={profile} kcalPerKg={tdeeParams.kcalPerKg}
           />
         )}
         {view === "stats" && (
           <StatsView
             adherence={adherence} phaseHist={phaseHist}
-            weekly={weekly} goalInfo={goalInfo} phase={phase}
+            weekly={weekly} goalInfo={goalInfo} phase={phase} tdeeHistory={tdeeState?.history || []}
             onDeletePhase={(date) => setDialog({
               title: "Delete phase record?",
               message: `Remove the phase change logged on ${date}? This only affects the history log, not your entries.`,
@@ -2262,6 +2373,35 @@ export default function App() {
               </button>
             </div>
           </div>
+
+          {/* Anything unusual? (feeds the TDEE review's confidence) */}
+          <div style={{ marginTop: 12, background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10, padding: "12px 16px" }}>
+            <button onClick={() => setFlagsOpen(o => !o)} style={{ width: "100%", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "space-between", padding: 0, color: "var(--text-bright)" }}>
+              <span style={{ fontSize: 11, letterSpacing: "0.08em", textTransform: "uppercase", fontWeight: 700 }}>
+                Anything unusual today?{(() => { const n = FLAG_OPTIONS.filter(f => (activeEntry.flags || []).includes(f.id)).length; return n ? ` · ${n} selected` : ""; })()}
+              </span>
+              <span style={{ fontSize: 11, color: "var(--text-dim)" }}>{flagsOpen ? "▴" : "▾"}</span>
+            </button>
+            {flagsOpen && (
+              <div style={{ marginTop: 12 }}>
+                {!dayHasData && <div style={{ fontSize: 10.5, color: "var(--text-dim)", marginBottom: 8 }}>Log a weight or calories for this day first.</div>}
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {FLAG_OPTIONS.map(f => {
+                    const on = (activeEntry.flags || []).includes(f.id);
+                    return (
+                      <button key={f.id} disabled={!dayHasData} onClick={() => updateDayFlags(activeDate, { [f.id]: !on })}
+                        style={{ background: on ? "#6366f126" : "transparent", border: `1px solid ${on ? "#6366f1" : "var(--border)"}`, color: on ? "#a5b4fc" : "var(--text-soft)", borderRadius: 999, padding: "5px 11px", fontSize: 11, fontWeight: 600, cursor: dayHasData ? "pointer" : "default", opacity: dayHasData ? 1 : 0.5 }}>
+                        {f.label}
+                      </button>
+                    );
+                  })}
+                </div>
+                <div style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 8, lineHeight: 1.5 }}>
+                  These make your TDEE review more careful about trusting this period. They never change your phase or calorie target.
+                </div>
+              </div>
+            )}
+          </div>
         </div>
 
         {/* ── Review prompt (2-week cycle due) ── */}
@@ -2441,50 +2581,20 @@ export default function App() {
             </div>
           </div>
 
-          {/* Measured estimate (information only) */}
-          <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 8, padding: "14px 16px", marginBottom: 14 }}>
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 8, flexWrap: "wrap" }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span style={{ fontSize: 9, letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--text-dim)", fontWeight: 600 }}>Measured estimate · info only</span>
-                {tdeeConfidence && (
-                  <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: "0.05em", color: tdeeConfidence === "high" ? "#34d399" : "#fbbf24" }}>
-                    {tdeeConfidence === "high" ? "● STABLE" : "● NOISY"}
-                  </span>
-                )}
-              </div>
-              {/* window toggle */}
-              <div style={{ display: "flex", gap: 4 }}>
-                {[14, 28].map(w => (
-                  <button key={w} onClick={() => { setTdeeWindow(w); persistSettings(phase, magnitude, w); }}
-                    style={{
-                      background: tdeeWindow === w ? "var(--surface-2)" : "transparent",
-                      border: `1px solid ${tdeeWindow === w ? "#34d399" : "var(--border)"}`,
-                      borderRadius: 5, padding: "4px 10px", cursor: "pointer",
-                      fontSize: 10, fontWeight: 600, color: tdeeWindow === w ? "#34d399" : "var(--text-muted)",
-                    }}>
-                    {w}d
-                  </button>
-                ))}
-              </div>
-            </div>
-            <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
-              <span style={{ fontSize: 24, fontWeight: 800, color: "#34d399", fontVariantNumeric: "tabular-nums", letterSpacing: "-0.02em" }}>
-                {tdee != null ? tdee.toLocaleString() : "—"}
-              </span>
-              <span style={{ fontSize: 11, color: "var(--text-muted)" }}>kcal/day</span>
-              {tdeeResult && (
-                <span style={{ fontSize: 10, color: "var(--text-dim)", marginLeft: 6 }}>
-                  from {tdeeResult.days}d · {tdeeResult.calorieDays} logged · {tdeeResult.weightPoints} weigh-ins
-                </span>
-              )}
-            </div>
-            {tdee14 && tdee28 && (
-              <div style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 6 }}>
-                14-day: {tdee14.tdee.toLocaleString()} · 28-day: {tdee28.tdee.toLocaleString()} kcal
-                {tdeeConfidence === "low" && <span style={{ color: "#fbbf24" }}> — windows disagree by &gt;300 kcal; keep logging before trusting the target.</span>}
-              </div>
-            )}
-          </div>
+          {/* TDEE review: countdown, preview and the review itself */}
+          {tdeeState && tdeeSched && (
+            <TdeeReviewSection
+              state={tdeeState} schedule={tdeeSched} assessment={tdeeAssessment}
+              due={tdeeDue} recheck={tdeeRechecking}
+              preview={previewTdee} setPreview={setPreviewTdee}
+              targetNow={baseTarget} targetIfAccepted={targetIfAccepted}
+              onAccept={confirmAcceptTdee} onKeep={keepTdee} onDefer={deferTdee}
+              onExplain={explainTraffic}
+              onReviewNow={() => saveTdeeState({ ...tdeeState, snoozedUntil: null })}
+              onWeightExclude={(d) => updateDayFlags(d, { [FLAGS.NON_STANDARD_WEIGHIN]: true })}
+              onWeightConfirm={(d) => updateDayFlags(d, { [FLAGS.WEIGHT_CONFIRMED]: true })}
+            />
+          )}
 
           {/* Target calorie card */}
           {target != null && (
@@ -2493,7 +2603,6 @@ export default function App() {
               border: `1px solid ${phaseInfo.color}40`,
               borderRadius: 8, padding: "14px 16px",
               display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10,
-              opacity: tdeeConfidence === "low" ? 0.7 : 1,
             }}>
               <div>
                 <div style={{ fontSize: 9, letterSpacing: "0.1em", textTransform: "uppercase", color: phaseInfo.color + "99", fontWeight: 600, marginBottom: 6 }}>
@@ -2527,12 +2636,7 @@ export default function App() {
 
           {target == null && sorted.length > 0 && (
             <div style={{ background: "var(--surface)", border: "1px dashed var(--border)", borderRadius: 8, padding: "14px 16px", fontSize: 11, color: "var(--text-muted)", lineHeight: 1.5 }}>
-              Log a bodyweight to generate a starting target from your profile. It refines into a measured TDEE after ~10 days of data.
-            </div>
-          )}
-          {tdee != null && (
-            <div style={{ fontSize: 10, color: "var(--border-strong)", marginTop: 6 }}>
-              TDEE from least-squares weight trend over {tdeeResult?.days}d × 7,700 kcal/kg vs. avg intake. Targets rounded to 25 kcal. Method per Helms et al. 2014 / adaptive-TDEE consensus.
+              Log a bodyweight to generate a starting target from your profile. A TDEE review opens after 14 days of data.
             </div>
           )}
         </div>
@@ -3039,7 +3143,7 @@ function MacroBar({ macros, phaseColor }) {
   );
 }
 
-function MacrosView({ macros, target, tdee, phase, phaseInfo, magInfo, magnitude, macroWeight, sortedLen, avgBf, profile }) {
+function MacrosView({ macros, target, tdee, phase, phaseInfo, magInfo, magnitude, macroWeight, sortedLen, avgBf, profile, kcalPerKg = KCAL_PER_KG }) {
   const [whatIf, setWhatIf] = useState(null); // null = follow target; number = override kcal
   if (tdee == null || target == null || !macros) {
     return (
@@ -3059,7 +3163,7 @@ function MacrosView({ macros, target, tdee, phase, phaseInfo, magInfo, magnitude
     ? (calcMacros(whatIf, macroWeight, phase, magnitude) || macros)
     : macros;
   // Implied weekly weight change at the active intake: (cals - TDEE)/7700 * 7
-  const impliedRate = ((activeCals - tdee) / KCAL_PER_KG) * 7; // kg/week
+  const impliedRate = ((activeCals - tdee) / kcalPerKg) * 7; // kg/week
   const m2 = activeMacros;
 
   const macroCards = [
@@ -3223,7 +3327,9 @@ function MacrosView({ macros, target, tdee, phase, phaseInfo, magInfo, magnitude
   );
 }
 
-function ProfileModal({ profile, age, baselineTDEE, onSave, onClose }) {
+function ProfileModal({ profile, age, baselineTDEE, tdeeParams, onSave, onClose }) {
+  const [capIn, setCapIn] = useState(String(tdeeParams?.cap ?? 100));
+  const [kcalIn, setKcalIn] = useState(String(tdeeParams?.kcalPerKg ?? 7700));
   const [dob, setDob] = useState(profile.dob || "");
   const [ft, setFt] = useState(profile.heightCm ? Math.floor(profile.heightCm / 30.48) : "");
   const [inch, setInch] = useState(profile.heightCm ? Math.round((profile.heightCm / 2.54) % 12) : "");
@@ -3234,7 +3340,9 @@ function ProfileModal({ profile, age, baselineTDEE, onSave, onClose }) {
   const liveAge = ageFromDOB(dob);
 
   const handleSave = () => {
-    onSave({ dob, heightCm: Math.round(heightCm * 10) / 10, sex, activity: Number(activity) });
+    const cap = Math.min(150, Math.max(50, Math.round((Number(capIn) || 100) / 5) * 5));
+    const kcalPerKg = Math.min(8000, Math.max(7000, Math.round(Number(kcalIn) || 7700)));
+    onSave({ dob, heightCm: Math.round(heightCm * 10) / 10, sex, activity: Number(activity) }, { cap, kcalPerKg });
   };
 
   const field = { background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 6, padding: "8px 10px", color: "var(--text)", fontSize: 13, outline: "none", width: "100%", boxSizing: "border-box" };
@@ -3286,6 +3394,20 @@ function ProfileModal({ profile, age, baselineTDEE, onSave, onClose }) {
                 <span style={{ fontSize: 10, color: "var(--text-dim)", marginLeft: 6 }}>×{a.value} · {a.sub}</span>
               </button>
             ))}
+          </div>
+        </div>
+
+        <div style={{ marginBottom: 18 }}>
+          <label style={lbl}>TDEE review</label>
+          <div style={{ display: "flex", gap: 10 }}>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 10, color: "var(--text-dim)", marginBottom: 4 }}>Max change per review (kcal, 50–150)</div>
+              <input type="number" value={capIn} min={50} max={150} step={5} onChange={e => setCapIn(e.target.value)} style={field} />
+            </div>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 10, color: "var(--text-dim)", marginBottom: 4 }}>kcal per kg of body weight</div>
+              <input type="number" value={kcalIn} min={7000} max={8000} step={50} onChange={e => setKcalIn(e.target.value)} style={field} />
+            </div>
           </div>
         </div>
 
@@ -3400,7 +3522,7 @@ const MAG_LABEL = {
   aggressive: "Aggressive", moderate: "Moderate", conservative: "Conservative", maintain: "Maintenance",
 };
 
-function StatsView({ adherence, phaseHist, onDeletePhase, onEditPhaseDate, weekly, goalInfo, phase }) {
+function StatsView({ adherence, phaseHist, onDeletePhase, onEditPhaseDate, weekly, goalInfo, phase, tdeeHistory = [] }) {
   const [editingDate, setEditingDate] = useState(null); // the original date being edited
   const [editValue, setEditValue] = useState("");
   const sortedHist = [...(phaseHist || [])].sort((a, b) => b.date.localeCompare(a.date));
@@ -3505,6 +3627,28 @@ function StatsView({ adherence, phaseHist, onDeletePhase, onEditPhaseDate, weekl
         </div>
       )}
 
+      {/* TDEE reviews */}
+      <div style={{ fontSize: 10, letterSpacing: "0.12em", textTransform: "uppercase", color: "var(--text-dim)", fontWeight: 600, marginBottom: 12 }}>TDEE Reviews</div>
+      {tdeeHistory.length > 0 ? (
+        <div style={{ border: "1px solid var(--border)", borderRadius: 10, overflow: "hidden", marginBottom: 24 }}>
+          {[...tdeeHistory].reverse().map((h, i, arr) => (
+            <div key={h.date + i} style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 14px", borderBottom: i < arr.length - 1 ? "1px solid var(--surface-2)" : "none" }}>
+              <div style={{ width: 8, height: 8, borderRadius: 4, background: (CONF_META[h.confidence] || {}).color || "var(--text-muted)", flexShrink: 0 }} />
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text)" }}>{h.date} · {DECISION_LABEL[h.decision] || h.decision}</div>
+                <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 2, fontVariantNumeric: "tabular-nums" }}>
+                  raw {h.raw != null ? h.raw.toLocaleString() : "—"} · TDEE {h.previous != null ? h.previous.toLocaleString() : "—"} → {h.applied != null ? h.applied.toLocaleString() : "—"}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div style={{ background: "var(--surface)", border: "1px dashed var(--border)", borderRadius: 8, padding: "28px 0", textAlign: "center", color: "var(--border-strong)", fontSize: 12, marginBottom: 24 }}>
+          Completed TDEE reviews will be listed here.
+        </div>
+      )}
+
       {/* Phase history */}
       <div style={{ fontSize: 10, letterSpacing: "0.12em", textTransform: "uppercase", color: "var(--text-dim)", fontWeight: 600, marginBottom: 12 }}>Phase History</div>
       {sortedHist.length > 0 ? (
@@ -3572,6 +3716,142 @@ function StatsView({ adherence, phaseHist, onDeletePhase, onEditPhaseDate, weekl
   );
 }
 
+// ── TDEE review (inside the TDEE card area) ──
+const CONF_META = {
+  green: { label: "Green — Reliable", color: "#34d399" },
+  amber: { label: "Amber — Uncertain", color: "#fbbf24" },
+  red: { label: "Red — Insufficient data", color: "#f87171" },
+};
+const DECISION_LABEL = { accept: "Accepted", keep: "Kept current", auto_keep: "Kept (automatic)" };
+
+function TdeeReviewSection({ state, schedule, assessment, due, recheck, preview, setPreview, targetNow, targetIfAccepted, onAccept, onKeep, onDefer, onExplain, onReviewNow, onWeightExclude, onWeightConfirm }) {
+  const fmtD = (s) => new Date(s + "T00:00:00").toLocaleDateString(undefined, { day: "numeric", month: "short" });
+  const a = assessment;
+  const showPanel = a != null && (due || preview);
+  const actionable = due && !preview && a != null;
+  const last = (state.history || []).length ? state.history[state.history.length - 1] : null;
+  const meta = a ? CONF_META[a.confidence] : null;
+  const pending = a ? a.suspectWeights.length : 0;
+  const ghost = { background: "transparent", border: "1px solid var(--border-strong)", color: "var(--text-soft)", borderRadius: 6, padding: "7px 14px", fontSize: 11, fontWeight: 600, cursor: "pointer" };
+  const fill = (c) => ({ background: c, border: "none", color: "#06121f", borderRadius: 6, padding: "7px 14px", fontSize: 11, fontWeight: 700, cursor: "pointer" });
+  const cell = (label, value, sub, color) => (
+    <div style={{ background: "var(--bg)", borderRadius: 8, padding: "9px 11px" }}>
+      <div style={{ fontSize: 9, letterSpacing: "0.08em", textTransform: "uppercase", color: "var(--text-dim)", fontWeight: 600, marginBottom: 4 }}>{label}</div>
+      <div style={{ fontSize: 14, fontWeight: 700, color: color || "var(--text)", fontVariantNumeric: "tabular-nums" }}>{value}</div>
+      {sub && <div style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 2 }}>{sub}</div>}
+    </div>
+  );
+
+  let status;
+  if (schedule.status === "countdown") status = `Next review in ${schedule.daysLeft} day${schedule.daysLeft === 1 ? "" : "s"} · ${fmtD(schedule.dueDate)}`;
+  else if (schedule.status === "snoozed") status = `Review snoozed until ${fmtD(schedule.until)}`;
+  else if (recheck) status = "Re-checking daily — your data isn't reliable enough yet";
+  else status = "Review due now";
+
+  return (
+    <div style={{ background: "var(--surface)", border: `1px solid ${showPanel && meta ? meta.color + "55" : "var(--border)"}`, borderRadius: 8, padding: "14px 16px", marginBottom: 14 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+        <div>
+          <div style={{ fontSize: 9, letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--text-dim)", fontWeight: 600, marginBottom: 5 }}>TDEE review</div>
+          <div style={{ fontSize: 12.5, fontWeight: 600, color: due ? "#fbbf24" : "var(--text)" }}>{status}</div>
+          {last && (
+            <div style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 3 }}>
+              Last review {fmtD(last.date)}: {last.confidence} · {DECISION_LABEL[last.decision] || last.decision}
+            </div>
+          )}
+        </div>
+        <div style={{ display: "flex", gap: 6 }}>
+          {schedule.status === "snoozed" && <button onClick={onReviewNow} style={ghost}>Review now</button>}
+          {!due && !preview && <button onClick={() => setPreview(true)} style={ghost}>Preview review</button>}
+          {!due && preview && <button onClick={() => setPreview(false)} style={ghost}>Close preview</button>}
+        </div>
+      </div>
+
+      {showPanel && (
+        <div style={{ marginTop: 14, borderTop: "1px solid var(--border)", paddingTop: 14 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+            <span style={{ width: 9, height: 9, borderRadius: 5, background: meta.color }} />
+            <span style={{ fontSize: 13, fontWeight: 700, color: meta.color }}>{meta.label}</span>
+            <button onClick={onExplain} aria-label="What do Green, Amber and Red mean?" style={{ background: "none", border: "1px solid var(--border-strong)", color: "var(--text-muted)", borderRadius: 999, width: 18, height: 18, fontSize: 10, fontWeight: 700, cursor: "pointer", lineHeight: 1, padding: 0 }}>i</button>
+          </div>
+          <div style={{ fontSize: 10, color: "var(--text-dim)", marginBottom: 12 }}>
+            {fmtD(a.window.start)} – {fmtD(a.window.end)}{!due ? " · preview only" : ""}
+          </div>
+
+          {pending > 0 && (
+            <div style={{ background: "#fbbf2412", border: "1px solid #fbbf2440", borderRadius: 8, padding: "10px 12px", marginBottom: 12 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: "#fbbf24", marginBottom: 6 }}>Check {pending === 1 ? "this weigh-in" : "these weigh-ins"} first</div>
+              {a.suspectWeights.map(s => (
+                <div key={s.date} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap", padding: "5px 0" }}>
+                  <span style={{ fontSize: 11, color: "var(--text-soft)" }}>
+                    {fmtD(s.date)} · <strong style={{ color: "var(--text)" }}>{s.weight.toFixed(1)} kg</strong> vs ~{s.expected.toFixed(1)} expected
+                  </span>
+                  <span style={{ display: "flex", gap: 6 }}>
+                    <button onClick={() => onWeightExclude(s.date)} style={{ ...ghost, padding: "4px 10px", fontSize: 10.5 }}>Exclude</button>
+                    <button onClick={() => onWeightConfirm(s.date)} style={{ ...ghost, padding: "4px 10px", fontSize: 10.5 }}>It's normal</button>
+                  </span>
+                </div>
+              ))}
+              {actionable && <div style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 4 }}>Accepting is disabled until each one is answered.</div>}
+            </div>
+          )}
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 12 }}>
+            {cell("Complete calorie days", `${a.counts.completeDays}/14`)}
+            {cell("Valid weigh-ins", `${a.counts.validWeighIns}`, a.counts.excludedWeighIns ? `${a.counts.excludedWeighIns} excluded` : null)}
+            {cell("Avg calories", a.avgCalories != null ? Math.round(a.avgCalories).toLocaleString() : "—", "complete days only")}
+            {cell("Weight trend", a.trend.weeklyRate != null ? `${a.trend.weeklyRate >= 0 ? "+" : ""}${a.trend.weeklyRate.toFixed(2)} kg/wk` : "—")}
+            {cell("Raw TDEE", a.rawTDEE != null ? Math.round(a.rawTDEE).toLocaleString() : "—", a.gap != null ? `${a.gap >= 0 ? "+" : ""}${Math.round(a.gap)} vs current` : null)}
+            {cell("Current TDEE", a.currentTDEE != null ? a.currentTDEE.toLocaleString() : "—")}
+            {cell("Proposed TDEE", a.proposedTDEE != null ? a.proposedTDEE.toLocaleString() : "—",
+              a.proposedChange != null ? `${a.proposedChange >= 0 ? "+" : ""}${a.proposedChange} kcal${a.capped ? " (capped)" : ""}` : null, meta.color)}
+          </div>
+
+          <div style={{ marginBottom: 12 }}>
+            {a.reasons.length === 0 ? (
+              <div style={{ fontSize: 11, color: "var(--text-soft)" }}>No concerns found in this period.</div>
+            ) : a.reasons.map((r, i) => (
+              <div key={i} style={{ display: "flex", gap: 8, fontSize: 11, color: "var(--text-soft)", lineHeight: 1.5, padding: "2px 0" }}>
+                <span style={{ color: r.level === "red" ? "#f87171" : "#fbbf24" }}>●</span><span>{r.text}</span>
+              </div>
+            ))}
+            {a.isFirstReview && !a.escapeRoute && (
+              <div style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 6 }}>First review: a larger step is allowed (50% of the gap, up to ±150 kcal).</div>
+            )}
+          </div>
+
+          {a.canAccept && targetNow != null && targetIfAccepted != null && (
+            <div style={{ fontSize: 10.5, color: "var(--text-soft)", lineHeight: 1.5, marginBottom: 12 }}>
+              If you accept, your daily target is recalculated for your current phase: <strong style={{ color: "var(--text)" }}>{targetNow.toLocaleString()} → {targetIfAccepted.toLocaleString()} kcal</strong>, and your calorie review window restarts today.
+            </div>
+          )}
+
+          {actionable && a.canAccept && (
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <button onClick={onAccept} disabled={pending > 0}
+                style={a.confidence === "green" ? { ...fill("#34d399"), opacity: pending > 0 ? 0.4 : 1, cursor: pending > 0 ? "default" : "pointer" } : { ...ghost, opacity: pending > 0 ? 0.4 : 1, cursor: pending > 0 ? "default" : "pointer" }}>
+                Accept {a.proposedTDEE.toLocaleString()}
+              </button>
+              <button onClick={onKeep} style={a.confidence === "amber" ? fill("#fbbf24") : ghost}>Keep current</button>
+              <button onClick={onDefer} style={ghost}>Defer 7 days</button>
+            </div>
+          )}
+          {actionable && !a.canAccept && (
+            <div style={{ fontSize: 11, color: "var(--text-muted)", lineHeight: 1.5 }}>
+              No change is recommended. Your TDEE stays as it is, and this re-checks every day until your recent data is reliable.
+            </div>
+          )}
+          {!due && (
+            <div style={{ fontSize: 11, color: "var(--text-muted)", lineHeight: 1.5 }}>
+              This is a preview of your last 14 days. You can act on a review from {fmtD(schedule.dueDate)}.
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ConfirmDialog({ title, message, actions, onClose }) {
   const btnStyle = (style) => {
     if (style === "primary") return { background: "#6366f1", color: "#fff", border: "none" };
@@ -3582,7 +3862,7 @@ function ConfirmDialog({ title, message, actions, onClose }) {
     <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 300, background: "var(--overlay)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
       <div onClick={e => e.stopPropagation()} style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: "22px", width: "100%", maxWidth: 340, boxShadow: "0 20px 60px var(--shadow)" }}>
         <div style={{ fontSize: 14, fontWeight: 700, color: "var(--text)", marginBottom: 10 }}>{title}</div>
-        {message && <div style={{ fontSize: 12.5, color: "var(--text-soft)", lineHeight: 1.55, marginBottom: 18 }}>{message}</div>}
+        {message && <div style={{ fontSize: 12.5, color: "var(--text-soft)", lineHeight: 1.55, marginBottom: 18, whiteSpace: "pre-line" }}>{message}</div>}
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {actions.map((a, i) => (
             <button key={i} onClick={a.onClick}
