@@ -10,6 +10,8 @@ const PHASEHIST_KEY = "body-tracker-phasehist";
 const THEME_KEY = "body-tracker-theme";
 const WATER_KEY = "body-tracker-water";
 const DIETBREAK_KEY = "body-tracker-diet-break";
+const TDEE_KEY = "body-tracker-tdee";
+const DIETBREAKLOG_KEY = "body-tracker-diet-break-log";
 
 // Structural color tokens. Accent colors (phase/macro) are left as literal hex
 // since they read well on both themes.
@@ -148,6 +150,428 @@ function linReg(points) {
 }
 const avg = (arr) => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null;
 
+// ═══ TDEE REVIEW LOGIC — BEGIN (tested copy; edit tdeeReview.js and regenerate, do not hand-edit) ═══
+// tdeeReview.js — Stage 1: pure TDEE review logic.
+// No React, no localStorage, no UI. Everything here is a plain function so it can be
+// tested with fixed numbers. Later stages wire it into App.jsx.
+//
+// Agreed design (see ticket): regression-based raw TDEE, 25% smoothing toward raw,
+// capped change per review, Red -> Amber -> Green confidence, user approval, and
+// weigh-in exclusion that removes weight AND body fat together.
+
+// ─── Constants & defaults ────────────────────────────────────────────────────
+
+const TDEE_DEFAULTS = {
+  kcalPerKg: 7700,      // single shared energy-equivalent value (configurable)
+  windowDays: 14,
+  smoothing: 0.25,      // fixed
+  cap: 100,             // kcal per review; configurable 50–150 in steps of 5
+  firstSmoothing: 0.5,  // first review only
+  firstCap: 150,        // first review only
+  roundTo: 5,
+  snoozeDays: 7,        // Defer
+  reviewEveryDays: 14,
+  // weigh-in flagging
+  suspectAbsKg: 1.0,
+  suspectPct: 1.5,
+  suspectMinPoints: 6,
+  saveMinPoints: 5,
+  // confidence thresholds
+  scatterSdKg: 0.6,
+  rateBWPctPerWeek: 1.0,
+  gapAmber: 300,
+  gapRed: 500,
+  creatineRateKgPerWeek: 0.5,
+};
+
+// Confounder flag ids (stored per day as entry.flags = [...ids]).
+const FLAGS = {
+  HIGH_CARB_SODIUM: "highCarbSodium",
+  ALCOHOL: "alcohol",
+  HARD_TRAINING: "hardTraining",
+  TRAVEL: "travel",
+  DIGESTIVE: "digestive",
+  ILLNESS: "illness",
+  CREATINE: "creatine",
+  ACTIVITY_CHANGED: "activityChanged",
+  NON_STANDARD_WEIGHIN: "nonStandardWeighIn", // = exclusion of that day's weight AND body fat
+  CALORIES_INCOMPLETE: "caloriesIncomplete",
+  OTHER: "other",
+};
+
+// A day counts as a "confounder day" if it has any of these. Training/DOMS,
+// incomplete calories and non-standard weigh-in have their own rules, so they are
+// not double-counted here.
+const CONFOUNDER_DAY_FLAGS = [
+  FLAGS.HIGH_CARB_SODIUM, FLAGS.ALCOHOL, FLAGS.TRAVEL, FLAGS.DIGESTIVE,
+  FLAGS.ILLNESS, FLAGS.CREATINE, FLAGS.ACTIVITY_CHANGED, FLAGS.OTHER,
+];
+
+// ─── Small helpers ───────────────────────────────────────────────────────────
+
+// Dates are YYYY-MM-DD strings. Work in UTC day numbers so DST never shifts a day.
+const dayNum = (s) => {
+  const [y, m, d] = s.split("-").map(Number);
+  return Date.UTC(y, m - 1, d) / 86400000;
+};
+const addDays = (s, n) => {
+  const [y, m, d] = s.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10);
+};
+
+const roundTo = (v, step) => Math.round(v / step) * step;
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+const mean = (a) => (a.length ? a.reduce((s, v) => s + v, 0) / a.length : null);
+
+const hasFlag = (entry, id) => Array.isArray(entry?.flags) && entry.flags.includes(id);
+
+// ─── Shared "valid readings" step ────────────────────────────────────────────
+// One place that decides whether a day's weight / body fat may be used. Every screen
+// that reads weight or body fat should go through this (Stage 2 wires that up).
+// A non-standard weigh-in removes weight AND body fat together; the raw entry is
+// never changed, so history is kept.
+
+function validReading(entry) {
+  if (!entry) return { weight: null, bf: null, excluded: false };
+  const excluded = hasFlag(entry, FLAGS.NON_STANDARD_WEIGHIN);
+  return {
+    weight: !excluded && entry.weight != null ? Number(entry.weight) : null,
+    bf: !excluded && entry.bf != null ? Number(entry.bf) : null,
+    excluded: excluded && (entry.weight != null || entry.bf != null),
+  };
+}
+
+// ─── Weigh-in flagging (detect, then the user confirms) ──────────────────────
+// Rule: flag a weight that is more than 1.0 kg AND more than 1.5% away from the
+// trend line for that date.
+
+const isSuspect = (deviation, expected, p) =>
+  Math.abs(deviation) > p.suspectAbsKg && (Math.abs(deviation) / expected) * 100 > p.suspectPct;
+
+// Review-time: leave-one-out, worst first. Each weight is compared with the line fitted to
+// all the OTHER weights still in the set. The single worst offender is flagged, removed, and
+// the rest are re-checked against the re-fitted line — so one spike can't make its normal-
+// looking neighbours look odd. points: [{date, weight}]
+function detectSuspectWeights(points, params = {}) {
+  const p = { ...TDEE_DEFAULTS, ...params };
+  let pool = points.slice();
+  const out = [];
+  while (pool.length >= p.suspectMinPoints) {
+    let worst = null;
+    for (let i = 0; i < pool.length; i++) {
+      const others = pool.filter((_, j) => j !== i).map((q) => ({ x: dayNum(q.date), y: q.weight }));
+      const reg = linReg(others);
+      if (!reg) continue;
+      const expected = reg.slope * dayNum(pool[i].date) + reg.intercept;
+      const deviation = pool[i].weight - expected;
+      if (isSuspect(deviation, expected, p) && (!worst || Math.abs(deviation) > Math.abs(worst.deviation))) {
+        worst = { date: pool[i].date, weight: pool[i].weight, expected, deviation };
+      }
+    }
+    if (!worst) break;
+    out.push(worst);
+    pool = pool.filter((q) => q.date !== worst.date);
+  }
+  return out;
+}
+
+// Save-time: compare a new weight with the trend of the previous 14 days (extrapolated).
+// Returns null if fine or not enough history, else {expected, deviation}.
+function checkNewWeight({ date, weight, entries, params = {} }) {
+  const p = { ...TDEE_DEFAULTS, ...params };
+  const pts = [];
+  for (let i = 1; i <= p.windowDays; i++) {
+    const d = addDays(date, -i);
+    const w = validReading(entries[d]).weight;
+    if (w != null) pts.push({ x: dayNum(d), y: w });
+  }
+  if (pts.length < p.saveMinPoints) return null;
+  const reg = linReg(pts);
+  if (!reg) return null;
+  const expected = reg.slope * dayNum(date) + reg.intercept;
+  const deviation = weight - expected;
+  return isSuspect(deviation, expected, p) ? { expected, deviation } : null;
+}
+
+// ─── The review ──────────────────────────────────────────────────────────────
+
+// Build the 14 calendar days ending yesterday. Today is never included (its calories
+// are not final). windowFloor (optional) stops a review reaching back before the last
+// accepted/kept review, which is what prevents the same days being counted twice.
+function buildWindow(entries, today, p, windowFloor) {
+  const end = addDays(today, -1);
+  const start = addDays(end, -(p.windowDays - 1));
+  const startNum = dayNum(start);
+  const days = [];
+  for (let i = 0; i < p.windowDays; i++) {
+    const date = addDays(start, i);
+    const inScope = !(windowFloor && date < windowFloor);
+    const e = inScope ? entries[date] : undefined;
+    const vr = validReading(e);
+    const calories = e?.calories != null ? Number(e.calories) : null;
+    days.push({
+      date, idx: i, week: i < 7 ? 1 : 2, x: dayNum(date) - startNum,
+      calories,
+      complete: calories != null && !hasFlag(e, FLAGS.CALORIES_INCOMPLETE),
+      weight: vr.weight, excludedWeighIn: vr.excluded,
+      flags: e?.flags || [],
+    });
+  }
+  return { start, end, days };
+}
+
+const longestRun = (days, pred) => {
+  let best = 0, run = 0;
+  for (const d of days) { run = pred(d) ? run + 1 : 0; best = Math.max(best, run); }
+  return best;
+};
+
+function assessReview({
+  entries,
+  today,
+  currentTDEE,
+  phaseHist = [],
+  dietBreakLog = [],   // [{start, end|null}]
+  isFirstReview = false,
+  priorLargeGapStreak = 0,
+  windowFloor = null,
+  params = {},
+}) {
+  const p = { ...TDEE_DEFAULTS, ...params };
+  const { start, end, days } = buildWindow(entries, today, p, windowFloor);
+
+  // ── Counts ──
+  const calorieDays = days.filter((d) => d.calories != null).length;
+  const completeDays = days.filter((d) => d.complete).length;
+  const validDays = days.filter((d) => d.weight != null);
+  const validWeighIns = validDays.length;
+  const validWeek1 = validDays.filter((d) => d.week === 1).length;
+  const validWeek2 = validDays.filter((d) => d.week === 2).length;
+  const excludedWeighIns = days.filter((d) => d.excludedWeighIn).length;
+  const incompleteRun = longestRun(days, (d) => !d.complete);
+
+  // ── Regression on valid weights → weekly rate → surplus → raw TDEE ──
+  const reg = validDays.length >= 2 ? linReg(validDays.map((d) => ({ x: d.x, y: d.weight }))) : null;
+  const slopePerDay = reg ? reg.slope : null;
+  const weeklyRate = slopePerDay != null ? slopePerDay * 7 : null;               // kg / week
+  const dailySurplus = slopePerDay != null ? slopePerDay * p.kcalPerKg : null;   // = weekly × kcalPerKg ÷ 7
+  const meanWeight = mean(validDays.map((d) => d.weight));
+  const weeklyPct = weeklyRate != null && meanWeight ? (weeklyRate / meanWeight) * 100 : null;
+  let scatterSd = null;
+  if (reg && validDays.length > 2) {
+    const ss = validDays.reduce((s, d) => s + (d.weight - (reg.slope * d.x + reg.intercept)) ** 2, 0);
+    scatterSd = Math.sqrt(ss / (validDays.length - 2)); // residual standard error
+  }
+  const avgCalories = mean(days.filter((d) => d.complete).map((d) => d.calories));
+  const rawTDEE = avgCalories != null && dailySurplus != null ? avgCalories - dailySurplus : null;
+  const gap = rawTDEE != null && currentTDEE != null ? rawTDEE - currentTDEE : null;
+
+  // ── Flag counts ──
+  const countFlag = (id) => days.filter((d) => d.flags.includes(id)).length;
+  const confounderDays = days.filter((d) => d.flags.some((f) => CONFOUNDER_DAY_FLAGS.includes(f))).length;
+  const trainingDays = countFlag(FLAGS.HARD_TRAINING);
+  const illnessDays = countFlag(FLAGS.ILLNESS);
+  const travelDays = countFlag(FLAGS.TRAVEL);
+  const creatineDays = countFlag(FLAGS.CREATINE);
+
+  // ── Phase / diet-break events inside the window (read-only) ──
+  const inWin = (d) => d >= start && d <= end;
+  const phaseChanges = phaseHist.filter((h) => inWin(h.date)).map((h) => h.date);
+  const dietBreakEvents = [];
+  for (const b of dietBreakLog) {
+    if (inWin(b.start)) dietBreakEvents.push(b.start);
+    if (b.end && inWin(b.end)) dietBreakEvents.push(b.end);
+  }
+
+  // ── Classification: Red → Amber → Green ──
+  const red = [], amber = [];
+  const R = (code, text) => red.push({ level: "red", code, text });
+  const A = (code, text) => amber.push({ level: "amber", code, text });
+
+  if (rawTDEE == null) R("no_estimate", "Not enough data to estimate TDEE.");
+  if (completeDays <= 11) R("complete_days", `Only ${completeDays} of 14 days have a complete calorie log (need 13+).`);
+  else if (completeDays === 12) A("complete_days", "12 of 14 days have a complete calorie log (13+ is Green).");
+  if (validWeighIns < 10) R("weigh_ins", `Only ${validWeighIns} valid weigh-ins (need 10+).`);
+  else if (validWeighIns <= 11) A("weigh_ins", `${validWeighIns} valid weigh-ins (12+ is Green).`);
+  if (validWeek1 < 5 || validWeek2 < 5) R("weigh_ins_per_week", `Week 1 has ${validWeek1} and week 2 has ${validWeek2} valid weigh-ins (need 5+ in each).`);
+  if (incompleteRun >= 5) R("incomplete_run", `${incompleteRun} incomplete calorie days in a row.`);
+  else if (incompleteRun >= 3) A("incomplete_run", `${incompleteRun} incomplete calorie days in a row.`);
+  if (excludedWeighIns >= 3) R("excluded_weigh_ins", `${excludedWeighIns} weigh-ins were marked non-standard.`);
+  else if (excludedWeighIns >= 1) A("excluded_weigh_ins", `${excludedWeighIns} weigh-in${excludedWeighIns > 1 ? "s were" : " was"} marked non-standard.`);
+  if (illnessDays >= 3) R("illness", `Illness or injury flagged on ${illnessDays} days.`);
+  else if (illnessDays >= 1) A("illness", `Illness or injury flagged on ${illnessDays} day${illnessDays > 1 ? "s" : ""}.`);
+  if (travelDays >= 5) R("travel", `Travel or disrupted routine on ${travelDays} days.`);
+  else if (travelDays >= 1) A("travel", `Travel or disrupted routine on ${travelDays} day${travelDays > 1 ? "s" : ""}.`);
+  if (creatineDays >= 3 && weeklyRate != null && Math.abs(weeklyRate) > p.creatineRateKgPerWeek) {
+    R("creatine", `Creatine change flagged on ${creatineDays} days with fast weight movement.`);
+  } else if (creatineDays >= 1) A("creatine", "Creatine change flagged in this period.");
+  if (confounderDays >= 7) R("confounders", `${confounderDays} days had confounders (water, sodium, alcohol, etc.).`);
+  else if (confounderDays >= 3) A("confounders", `${confounderDays} days had confounders (water, sodium, alcohol, etc.).`);
+  if (trainingDays >= 6) A("training", `Hard training or DOMS on ${trainingDays} days.`);
+  if ((scatterSd != null && scatterSd > p.scatterSdKg) || (weeklyPct != null && Math.abs(weeklyPct) > p.rateBWPctPerWeek)) {
+    A("trend", scatterSd != null && scatterSd > p.scatterSdKg
+      ? `Daily weights are scattered (±${scatterSd.toFixed(2)} kg around the trend).`
+      : `Weight is changing fast (${weeklyPct.toFixed(1)}% of bodyweight per week).`);
+  }
+  if (phaseChanges.length) A("phase_change", "A phase change happened inside this window.");
+  if (dietBreakEvents.length) A("diet_break", "A diet break or deload started or ended inside this window.");
+  if (gap != null) {
+    if (Math.abs(gap) > p.gapRed) R("gap", `Raw TDEE is ${Math.round(Math.abs(gap))} kcal ${gap > 0 ? "above" : "below"} your current TDEE.`);
+    else if (Math.abs(gap) > p.gapAmber) A("gap", `Raw TDEE is ${Math.round(Math.abs(gap))} kcal ${gap > 0 ? "above" : "below"} your current TDEE.`);
+  }
+
+  // A Red caused ONLY by a large gap, with otherwise clean data, is recorded separately:
+  // if it repeats, the next review is downgraded to Amber so a wrong starting TDEE can
+  // still be corrected (manual Accept, same capped step).
+  const gapOnlyRed = red.length === 1 && red[0].code === "gap";
+  let escapeRoute = false;
+  let redReasons = red;
+  if (gapOnlyRed && priorLargeGapStreak >= 1) {
+    escapeRoute = true;
+    redReasons = [];
+    amber.push({ level: "amber", code: "gap_persistent", text: "Your data has been reliable across consecutive reviews, but raw TDEE is still far from your current TDEE. You can accept a capped step toward it." });
+  }
+
+  const confidence = redReasons.length ? "red" : amber.length ? "amber" : "green";
+  const reasons = [...redReasons, ...amber];
+
+  // ── Smoothing, cap, rounding ──
+  // The larger first-review step never applies on the escape route (it may rest on a noisy window).
+  const useFirst = isFirstReview && !escapeRoute;
+  const smoothing = useFirst ? p.firstSmoothing : p.smoothing;
+  const cap = useFirst ? p.firstCap : p.cap;
+  let proposedTDEE = null, proposedChange = null, capped = false;
+  if (rawTDEE != null && currentTDEE != null) {
+    const blended = currentTDEE * (1 - smoothing) + rawTDEE * smoothing;
+    const delta = clamp(blended - currentTDEE, -cap, cap);
+    capped = Math.abs(blended - currentTDEE) > cap;
+    proposedTDEE = roundTo(currentTDEE + delta, p.roundTo);
+    proposedChange = proposedTDEE - currentTDEE;
+  }
+
+  const suspectWeights = detectSuspectWeights(validDays.map((d) => ({ date: d.date, weight: d.weight })), p);
+
+  return {
+    window: { start, end },
+    counts: { calorieDays, completeDays, validWeighIns, validWeek1, validWeek2, excludedWeighIns, incompleteRun, confounderDays, trainingDays, illnessDays, travelDays, creatineDays },
+    trend: { weeklyRate, weeklyPct, dailySurplus, scatterSd, meanWeight },
+    avgCalories, rawTDEE, currentTDEE, gap,
+    proposedTDEE, proposedChange, capped, smoothing, cap, isFirstReview,
+    confidence, reasons, escapeRoute, gapOnlyRed,
+    phaseChanges, dietBreakEvents,
+    suspectWeights, needsWeighInConfirmation: suspectWeights.length > 0,
+    canAccept: confidence !== "red" && proposedTDEE != null,
+    defaultAction: confidence === "green" ? "accept" : confidence === "amber" ? "keep" : null,
+  };
+}
+
+// ─── Review schedule (countdown) ─────────────────────────────────────────────
+// status: "countdown" | "due" | "rechecking" | "snoozed"
+function reviewSchedule({ lastEventDate, snoozedUntil = null, today, lastConfidence = null, params = {} }) {
+  const p = { ...TDEE_DEFAULTS, ...params };
+  const dueDate = addDays(lastEventDate, p.reviewEveryDays);
+  if (snoozedUntil && today < snoozedUntil) return { status: "snoozed", until: snoozedUntil, dueDate };
+  if (today < dueDate) return { status: "countdown", daysLeft: dayNum(dueDate) - dayNum(today), dueDate };
+  return { status: lastConfidence === "red" ? "rechecking" : "due", dueDate };
+}
+
+// ─── Decisions ───────────────────────────────────────────────────────────────
+// State (persisted in Stage 2):
+// { currentTDEE, source, lastEventDate, lastAcceptDate, snoozedUntil, largeGapStreak, history: [] }
+// decision: "accept" | "keep" | "defer" | "auto_keep"
+//   accept    — applies the proposed TDEE, starts a fresh 14-day window today.
+//   keep      — declines, next review in 14 days.
+//   defer     — no decision recorded; prompt hidden for 7 days; window not reset.
+//   auto_keep — used when data was clean but the gap was >500 (gap-only Red): recorded as a
+//               review so the large-gap streak can build. Does not change TDEE.
+function applyDecision(state, decision, review, today, params = {}) {
+  const p = { ...TDEE_DEFAULTS, ...params };
+  const next = { ...state, history: [...(state.history || [])] };
+  const log = (applied) => next.history.push({
+    date: today, decision, confidence: review.confidence,
+    raw: review.rawTDEE != null ? Math.round(review.rawTDEE) : null,
+    proposed: review.proposedTDEE, previous: state.currentTDEE, applied,
+    reasons: review.reasons.map((r) => r.code),
+  });
+
+  if (decision === "accept") {
+    if (!review.canAccept) return state; // Red can never be accepted
+    next.currentTDEE = review.proposedTDEE;
+    next.source = "accepted";
+    next.lastEventDate = today;
+    next.lastAcceptDate = today;
+    next.snoozedUntil = null;
+    next.largeGapStreak = 0;
+    log(review.proposedTDEE);
+  } else if (decision === "keep" || decision === "auto_keep") {
+    next.lastEventDate = today;
+    next.snoozedUntil = null;
+    next.largeGapStreak = review.gapOnlyRed ? (state.largeGapStreak || 0) + 1 : 0;
+    log(state.currentTDEE);
+  } else if (decision === "defer") {
+    next.snoozedUntil = addDays(today, p.snoozeDays);
+    // Defer records nothing in history and does not move lastEventDate.
+  }
+  return next;
+}
+
+// ─── Stage 2 helpers (pure) ──────────────────────────────────────────────────
+
+// Copy of entries with weight/body fat blanked on non-standard weigh-ins. Every screen that
+// reads weight or body fat uses this; calories/protein pass through untouched.
+function buildValidEntries(entries) {
+  const out = {};
+  for (const d of Object.keys(entries)) {
+    const vr = validReading(entries[d]);
+    out[d] = { ...entries[d], weight: vr.weight, bf: vr.bf };
+  }
+  return out;
+}
+
+// Field-level merge per day: incoming fields win only where they exist; a day's flags are kept
+// unless the incoming record carries flags.
+function mergeEntries(existing, incoming) {
+  const out = { ...existing };
+  for (const d of Object.keys(incoming)) out[d] = { ...(existing[d] || {}), ...incoming[d] };
+  return out;
+}
+
+// CSV: date,calories,weight_kg,body_fat_pct,protein_g,flags   (flags joined with "|")
+function entriesToCSV(entries) {
+  const header = "date,calories,weight_kg,body_fat_pct,protein_g,flags";
+  const rows = Object.keys(entries).sort().map((d) => {
+    const e = entries[d] || {};
+    const n = (v) => (v != null ? Number(v) : "");
+    return [d, n(e.calories), n(e.weight), n(e.bf), n(e.protein), Array.isArray(e.flags) ? e.flags.join("|") : ""].join(",");
+  });
+  return [header, ...rows].join("\n");
+}
+
+// Reads the new format and the old 5-column format.
+function csvToEntries(text) {
+  const lines = text.trim().split(/\r?\n/);
+  const out = {};
+  const header = lines[0]?.toLowerCase() ?? "";
+  const start = header.includes("date") ? 1 : 0;
+  for (let i = start; i < lines.length; i++) {
+    const cols = lines[i].split(",");
+    const date = (cols[0] || "").trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
+    const rec = {};
+    const cal = parseFloat(cols[1]); if (!isNaN(cal)) rec.calories = cal;
+    const wt = parseFloat(cols[2]); if (!isNaN(wt)) rec.weight = wt;
+    const bf = parseFloat(cols[3]); if (!isNaN(bf)) rec.bf = bf;
+    const pr = parseFloat(cols[4]); if (!isNaN(pr)) rec.protein = pr;
+    const fl = (cols[5] || "").split("|").map((s) => s.trim()).filter(Boolean);
+    if (fl.length) rec.flags = fl;
+    if (Object.keys(rec).length) out[date] = rec;
+  }
+  return out;
+}
+// ═══ TDEE REVIEW LOGIC — END ═══
+
+const KCAL_PER_KG = TDEE_DEFAULTS.kcalPerKg; // single shared energy-equivalent value
+
 function parseEntry(e) {
   return {
     calories: e.calories != null ? Number(e.calories) : null,
@@ -173,7 +597,7 @@ function calcTDEEWindow(dated, windowDays, asOfTs = Date.now()) {
   if (!reg) return null;
   const avgCals = avg(cals);
   const dailyKgChange = reg.slope * 86400000; // slope is kg per ms
-  const dailySurplus = dailyKgChange * 7700;  // kcal/day implied by weight trend
+  const dailySurplus = dailyKgChange * KCAL_PER_KG;  // kcal/day implied by weight trend
   return {
     tdee: Math.round(avgCals - dailySurplus),
     days: Math.round(spanDays),
@@ -466,6 +890,10 @@ export default function App() {
   const [dietBreakMode, setDietBreakMode] = useState(null); // { active: bool, startDate: string }
   // Phase history: array of { date, phase, magnitude }
   const [phaseHist, setPhaseHist] = useState([]);
+  // Approved TDEE state: { currentTDEE, source, lastEventDate, lastAcceptDate, snoozedUntil, largeGapStreak, history } | null
+  const [tdeeState, setTdeeState] = useState(null);
+  const [dietBreakLog, setDietBreakLog] = useState([]); // [{ start, end|null }]
+  const [morningExcludeEdit, setMorningExcludeEdit] = useState(null); // null = follow saved flag
   const fileInputRef = useRef(null);
   const dateInputRef = useRef(null);
 
@@ -493,6 +921,10 @@ export default function App() {
       if (wl) setWaterLog(wl);
       const db = store.get(DIETBREAK_KEY);
       if (db) setDietBreakMode(db);
+      const ts = store.get(TDEE_KEY);
+      if (ts) setTdeeState(ts);
+      const dbl = store.get(DIETBREAKLOG_KEY);
+      if (Array.isArray(dbl)) setDietBreakLog(dbl);
     } catch (_) {}
     setLoaded(true);
   }, []);
@@ -562,6 +994,16 @@ export default function App() {
     saveWater({ ...waterLog, [date]: { ...day, gymDay: val } });
   };
   const saveDietBreak = (next) => { setDietBreakMode(next); store.set(DIETBREAK_KEY, next); };
+  const saveTdeeState = (next) => { setTdeeState(next); store.set(TDEE_KEY, next); };
+  const saveDietBreakLog = (next) => { setDietBreakLog(next); store.set(DIETBREAKLOG_KEY, next); };
+  const startDietBreak = () => {
+    saveDietBreak({ active: true, startDate: today });
+    if (!dietBreakLog.some(b => b.end == null)) saveDietBreakLog([...dietBreakLog, { start: today, end: null }]);
+  };
+  const endDietBreak = () => {
+    saveDietBreak(null);
+    saveDietBreakLog(dietBreakLog.map(b => b.end == null ? { ...b, end: today } : b));
+  };
 
   const savePhaseHist = (next) => {
     setPhaseHist(next);
@@ -574,7 +1016,7 @@ export default function App() {
     setMagnitude(m);
     persistSettings(p, m);
     // New phase/intensity → start a fresh review cycle anchored today
-    const nt = calcTarget(measuredTDEE ?? calcBaselineTDEE(profile, macroWeight), p, m);
+    const nt = calcTarget(effectiveTDEE, p, m);
     if (nt != null) saveCycle({ anchorDate: today, lockedTarget: nt, syncedPhaseDate: today });
     // Append to phase history (replace same-day record so toggling doesn't spam)
     if (changed) {
@@ -585,53 +1027,52 @@ export default function App() {
   };
 
   // Save a partial set of fields into the active date (merge, never overwrite siblings)
-  // Outlier check: compare a new weight against the most recent prior reading.
-  // Flags implausible day-to-day jumps (>2.5% BW or >2.5kg, whichever is smaller-magnitude
-  // trigger) as likely water/sodium/measurement noise rather than real fat/muscle change.
-  const checkWeightOutlier = (newWeight) => {
-    const priorDates = sorted.filter(d => d !== activeDate && entries[d]?.weight != null);
-    if (priorDates.length === 0) return null;
-    const priorDate = priorDates[priorDates.length - 1];
-    const priorWeight = Number(entries[priorDate].weight);
-    const daysApart = Math.max(1, Math.abs((new Date(activeDate + "T00:00:00") - new Date(priorDate + "T00:00:00")) / 86400000));
-    const diff = newWeight - priorWeight;
-    const pctChange = Math.abs(diff) / priorWeight;
-    // Scale tolerance by days apart (a jump over many days is less suspicious per-day)
-    const threshold = Math.max(0.025, 0.012 * daysApart); // 2.5% minimum, loosens ~1.2%/day gap
-    if (pctChange > threshold && Math.abs(diff) > 1.0) {
-      return { priorDate, priorWeight, diff, daysApart };
-    }
-    return null;
-  };
+  // Exclusion state for the active day (non-standard weigh-in = weight AND body fat left out of all calculations)
+  const savedExclude = hasFlag(entries[activeDate], FLAGS.NON_STANDARD_WEIGHIN);
+  const morningExclude = morningExcludeEdit ?? savedExclude;
 
-  const saveFields = async (fields) => {
+  // opts.exclude: undefined = leave the flag alone, true/false = set/clear "non-standard weigh-in"
+  const saveFields = async (fields, opts = {}) => {
     const clean = {};
     Object.entries(fields).forEach(([k, v]) => { if (v !== "" && v != null) clean[k] = Number(v); });
-    if (!Object.keys(clean).length) return false;
-    const next = { ...entries, [activeDate]: { ...(entries[activeDate] || {}), ...clean } };
+    if (!Object.keys(clean).length && opts.exclude === undefined) return false;
+    const prev = entries[activeDate] || {};
+    const entry = { ...prev, ...clean };
+    if (opts.exclude !== undefined) {
+      const set = new Set(prev.flags || []);
+      if (opts.exclude) set.add(FLAGS.NON_STANDARD_WEIGHIN); else set.delete(FLAGS.NON_STANDARD_WEIGHIN);
+      if (set.size) entry.flags = [...set]; else delete entry.flags;
+    }
+    const next = { ...entries, [activeDate]: entry };
     setEntries(next);
     await persist(next);
     return true;
   };
 
   const handleSaveMorning = async () => {
-    if (morningForm.weight !== "") {
-      const outlier = checkWeightOutlier(Number(morningForm.weight));
-      if (outlier) {
-        const sign = outlier.diff > 0 ? "+" : "";
+    const flagPatch = morningExclude !== savedExclude ? morningExclude : undefined;
+    const commit = async (exclude) => {
+      const ok = await saveFields({ weight: morningForm.weight, bf: morningForm.bf }, { exclude });
+      if (ok) { setMorningForm({ weight: "", bf: "" }); setMorningExcludeEdit(null); }
+    };
+    // Unusual against the recent trend? Offer to exclude it (unless it is already being excluded).
+    if (morningForm.weight !== "" && !morningExclude) {
+      const odd = checkNewWeight({ date: activeDate, weight: Number(morningForm.weight), entries });
+      if (odd) {
+        const sign = odd.deviation > 0 ? "+" : "";
         setDialog({
-          title: "Unusual weight jump",
-          message: `${sign}${outlier.diff.toFixed(1)} kg vs ${outlier.priorWeight.toFixed(1)} kg on ${outlier.priorDate} (${outlier.daysApart}d ago). This is a bigger swing than typical day-to-day change — likely water, sodium, or a digit slip rather than real fat/muscle change. Save it anyway?`,
+          title: "Unusual weight",
+          message: `${sign}${odd.deviation.toFixed(1)} kg from your recent trend (about ${odd.expected.toFixed(1)} kg expected). That is a bigger swing than usual — often water, sodium, or a different scale/time. Exclude it from your trend, TDEE and averages? It stays in your log either way.`,
           actions: [
-            { label: "Save anyway", style: "primary", onClick: async () => { setDialog(null); const ok = await saveFields({ weight: morningForm.weight, bf: morningForm.bf }); if (ok) setMorningForm({ weight: "", bf: "" }); } },
+            { label: "Save & exclude", style: "primary", onClick: async () => { setDialog(null); await commit(true); } },
+            { label: "Save anyway", style: "ghost", onClick: async () => { setDialog(null); await commit(flagPatch); } },
             { label: "Let me fix it", style: "ghost", onClick: () => setDialog(null) },
           ],
         });
         return;
       }
     }
-    const ok = await saveFields({ weight: morningForm.weight, bf: morningForm.bf });
-    if (ok) setMorningForm({ weight: "", bf: "" });
+    await commit(flagPatch);
   };
 
   const handleSaveEvening = async () => {
@@ -652,11 +1093,13 @@ export default function App() {
     setActiveDate(date);
     setMorningForm({ weight: e.weight ?? "", bf: e.bf ?? "" });
     setEveningForm({ calories: e.calories ?? "", protein: e.protein ?? "" });
+    setMorningExcludeEdit(null);
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
   const resetToToday = () => {
     setActiveDate(today);
+    setMorningExcludeEdit(null);
     setMorningForm({ weight: "", bf: "" });
     setEveningForm({ calories: "", protein: "" });
   };
@@ -678,7 +1121,9 @@ export default function App() {
   };
 
   const sorted = Object.keys(entries).sort();
-  const last7 = sorted.slice(-7).map(d => ({ date: d, ...parseEntry(entries[d]) }));
+  // Weight/body fat as used by every calculation (non-standard weigh-ins removed). Raw `entries` stays intact.
+  const validEntries = buildValidEntries(entries);
+  const last7 = sorted.slice(-7).map(d => ({ date: d, ...parseEntry(validEntries[d]) }));
 
   // Gap detection: days since the most recent logged entry
   const GAP_THRESHOLD = 7;
@@ -697,7 +1142,7 @@ export default function App() {
   const avgBf = avg(last7.map(e => e.bf).filter(v => v != null));
 
   // Dated series for regression-based TDEE
-  const datedAll = sorted.map(d => ({ date: d, ts: new Date(d + "T00:00:00").getTime(), ...parseEntry(entries[d]) }));
+  const datedAll = sorted.map(d => ({ date: d, ts: new Date(d + "T00:00:00").getTime(), ...parseEntry(validEntries[d]) }));
   const tdee14 = calcTDEEWindow(datedAll, 14);
   const tdee28 = calcTDEEWindow(datedAll, 28);
   const tdeeResult = tdeeWindow === 28 ? tdee28 : tdee14;
@@ -712,7 +1157,7 @@ export default function App() {
   // Bodyweight: most recent logged weight, else 7-day average
   const latestWeight = (() => {
     for (let i = sorted.length - 1; i >= 0; i--) {
-      const w = entries[sorted[i]]?.weight;
+      const w = validEntries[sorted[i]]?.weight;
       if (w != null) return Number(w);
     }
     return null;
@@ -722,8 +1167,10 @@ export default function App() {
   // Effective TDEE: use measured (regression) when reliable, else Mifflin-St Jeor baseline
   const measuredTDEE = tdee;
   const baselineTDEE = calcBaselineTDEE(profile, macroWeight);
-  const effectiveTDEE = measuredTDEE ?? baselineTDEE;
-  const tdeeSource = measuredTDEE != null ? "measured" : (baselineTDEE != null ? "baseline" : null);
+  // Only an approved TDEE feeds targets, macros, diet break and reports. The measured estimate is info only.
+  const approvedTDEE = tdeeState?.currentTDEE ?? null;
+  const effectiveTDEE = approvedTDEE ?? baselineTDEE;
+  const tdeeSource = approvedTDEE != null ? "approved" : (baselineTDEE != null ? "baseline" : null);
 
   const formulaTarget = calcTarget(effectiveTDEE, phase, magnitude);
 
@@ -880,7 +1327,7 @@ export default function App() {
   // ── Report: build a full data + insights bundle for [start, end] ──
   function buildReport(startDate, endDate) {
     const rangeDates = sorted.filter(d => d >= startDate && d <= endDate);
-    const rangeEntries = rangeDates.map(d => ({ date: d, ...parseEntry(entries[d]) }));
+    const rangeEntries = rangeDates.map(d => ({ date: d, ...parseEntry(validEntries[d]) }));
     const spanDays = Math.max(1, Math.round((new Date(endDate + "T00:00:00") - new Date(startDate + "T00:00:00")) / 86400000) + 1);
 
     const calRows = rangeEntries.filter(e => e.calories != null);
@@ -1000,7 +1447,7 @@ export default function App() {
     const avgCalPrev = avg(calsPrev);
 
     // weight change over the last 7d via regression (robust to noise)
-    const wPtsThis = thisWk.filter(d => entries[d].weight != null).map(d => ({ x: new Date(d + "T00:00:00").getTime(), y: entries[d].weight }));
+    const wPtsThis = thisWk.filter(d => validEntries[d].weight != null).map(d => ({ x: new Date(d + "T00:00:00").getTime(), y: validEntries[d].weight }));
     let wkWeightChange = null;
     if (wPtsThis.length >= 2) {
       const reg = linReg(wPtsThis);
@@ -1011,7 +1458,7 @@ export default function App() {
     const proteinHit = (target != null && macros) ? proteinDays.filter(d => entries[d].protein >= macros.proteinG * 0.9).length : null;
 
     const calLogged = calsThis.length;
-    const wtLogged = thisWk.filter(d => entries[d].weight != null).length;
+    const wtLogged = thisWk.filter(d => validEntries[d].weight != null).length;
 
     return {
       avgCalThis, avgCalPrev,
@@ -1067,6 +1514,27 @@ export default function App() {
     }
   }, [loaded]);
 
+  // First load after this update: approve whatever TDEE the app is showing today so nothing changes,
+  // rounded to 5 kcal. New users get the profile baseline. The first review is then 14 days away.
+  useEffect(() => {
+    if (!loaded || tdeeState != null) return;
+    const seed = measuredTDEE ?? baselineTDEE;
+    if (seed == null) return; // nothing to approve yet — retry once a weight is logged
+    saveTdeeState({
+      currentTDEE: roundTo(seed, TDEE_DEFAULTS.roundTo),
+      source: measuredTDEE != null ? "migrated" : "baseline",
+      lastEventDate: today, lastAcceptDate: null, snoozedUntil: null, largeGapStreak: 0, history: [],
+    });
+  }, [loaded, tdeeState, measuredTDEE, baselineTDEE]);
+
+  // A diet break already running before the log existed: record its start.
+  useEffect(() => {
+    if (!loaded) return;
+    if (dietBreakMode?.active && !dietBreakLog.some(b => b.end == null)) {
+      saveDietBreakLog([...dietBreakLog, { start: dietBreakMode.startDate, end: null }]);
+    }
+  }, [loaded, dietBreakMode]);
+
   // Returning after a gap: re-anchor the review cycle to today so the next review
   // measures a clean fresh window rather than a stretched, patchy one. Runs once on load.
   const gapHandledRef = useRef(false);
@@ -1114,6 +1582,8 @@ export default function App() {
   const activeEntry = entries[activeDate] || {};
   const isToday = activeDate === today;
   const morningLogged = activeEntry.weight != null || activeEntry.bf != null;
+  const morningFlagChanged = morningExclude !== savedExclude;
+  const morningDisabled = morningForm.weight === "" && morningForm.bf === "" && !(morningFlagChanged && morningLogged);
   const eveningLogged = activeEntry.calories != null;
 
   const phaseInfo = PHASES[phase];
@@ -1138,7 +1608,7 @@ export default function App() {
   const chartData = sorted
     .filter(d => d >= cutoffStr)
     .map(d => {
-      const e = parseEntry(entries[d]);
+      const e = parseEntry(validEntries[d]);
       return {
         date: d,
         ts: new Date(d + "T00:00:00").getTime(),
@@ -1181,17 +1651,10 @@ export default function App() {
   // ── Export helpers ──
   const showToast = (msg) => { setToast(msg); setTimeout(() => setToast(""), 2200); };
 
-  const buildCSV = () => {
-    const header = "date,calories,weight_kg,body_fat_pct,protein_g";
-    const rows = sorted.map(d => {
-      const e = parseEntry(entries[d]);
-      return [d, e.calories ?? "", e.weight ?? "", e.bf ?? "", e.protein ?? ""].join(",");
-    });
-    return [header, ...rows].join("\n");
-  };
+  const buildCSV = () => entriesToCSV(entries);
 
   const buildJSON = () => JSON.stringify(
-    { exported: new Date().toISOString(), phase, magnitude, tdeeWindow, profile, cycle, goal, phaseHist, entries },
+    { exported: new Date().toISOString(), phase, magnitude, tdeeWindow, profile, cycle, goal, phaseHist, tdeeState, dietBreakLog, dietBreakMode, waterLog, entries },
     null, 2
   );
 
@@ -1364,26 +1827,6 @@ export default function App() {
     fileInputRef.current?.click();
   };
 
-  // Parse a CSV in the same shape we export: date,calories,weight_kg,body_fat_pct,protein_g
-  const parseCSV = (text) => {
-    const lines = text.trim().split(/\r?\n/);
-    const out = {};
-    const header = lines[0]?.toLowerCase() ?? "";
-    const start = header.includes("date") ? 1 : 0;
-    for (let i = start; i < lines.length; i++) {
-      const cols = lines[i].split(",");
-      const date = (cols[0] || "").trim();
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
-      const rec = {};
-      const cal = parseFloat(cols[1]); if (!isNaN(cal)) rec.calories = cal;
-      const wt = parseFloat(cols[2]); if (!isNaN(wt)) rec.weight = wt;
-      const bf = parseFloat(cols[3]); if (!isNaN(bf)) rec.bf = bf;
-      const pr = parseFloat(cols[4]); if (!isNaN(pr)) rec.protein = pr;
-      if (Object.keys(rec).length) out[date] = rec;
-    }
-    return out;
-  };
-
   const handleImportFile = async (e) => {
     const file = e.target.files?.[0];
     e.target.value = ""; // reset so the same file can be re-picked later
@@ -1396,10 +1839,10 @@ export default function App() {
       try {
         const parsed = JSON.parse(text);
         imported = parsed.entries ?? parsed; // accept {entries,...} or bare map
-        if (parsed.phase || parsed.magnitude || parsed.tdeeWindow || parsed.profile || parsed.cycle || parsed.goal || parsed.phaseHist) settings = parsed;
+        if (parsed.phase || parsed.magnitude || parsed.tdeeWindow || parsed.profile || parsed.cycle || parsed.goal || parsed.phaseHist || parsed.tdeeState || parsed.dietBreakLog || parsed.waterLog || parsed.dietBreakMode !== undefined) settings = parsed;
       } catch (_) { showToast("Invalid JSON file"); return; }
     } else {
-      imported = parseCSV(text);
+      imported = csvToEntries(text);
     }
 
     if (!imported || typeof imported !== "object" || !Object.keys(imported).length) {
@@ -1421,6 +1864,10 @@ export default function App() {
         if (settings.cycle) saveCycle(settings.cycle);
         if (settings.goal !== undefined) saveGoal(settings.goal);
         if (settings.phaseHist) savePhaseHist(settings.phaseHist);
+        if (settings.tdeeState) saveTdeeState(settings.tdeeState);
+        if (Array.isArray(settings.dietBreakLog)) saveDietBreakLog(settings.dietBreakLog);
+        if (settings.dietBreakMode !== undefined) saveDietBreak(settings.dietBreakMode);
+        if (settings.waterLog) saveWater(settings.waterLog);
       }
       showToast(`Imported ${incomingCount} entries`);
     };
@@ -1434,7 +1881,7 @@ export default function App() {
       title: "Import data",
       message: `This file has ${incomingCount} entries. You already have ${existingCount}. How should they combine?`,
       actions: [
-        { label: "Merge", style: "primary", onClick: () => { setDialog(null); applyImport({ ...entries, ...imported }); } },
+        { label: "Merge", style: "primary", onClick: () => { setDialog(null); applyImport(mergeEntries(entries, imported)); } },
         { label: "Replace all", style: "danger", onClick: () => { setDialog(null); applyImport(imported); } },
         { label: "Cancel", style: "ghost", onClick: () => setDialog(null) },
       ],
@@ -1737,14 +2184,21 @@ export default function App() {
                   onChange={e => setMorningForm(f => ({ ...f, bf: e.target.value }))}
                   style={inputStyle} />
               </div>
+              <label style={{ display: "flex", alignItems: "flex-start", gap: 7, marginBottom: 14, cursor: "pointer", fontSize: 10.5, color: "var(--text-soft)", lineHeight: 1.4 }}>
+                <input type="checkbox" checked={morningExclude}
+                  disabled={!(activeEntry.weight != null || activeEntry.bf != null || morningForm.weight !== "" || morningForm.bf !== "")}
+                  onChange={e => setMorningExcludeEdit(e.target.checked)}
+                  style={{ accentColor: "#8b5cf6", width: 14, height: 14, marginTop: 1, flexShrink: 0 }} />
+                <span>Non-standard weigh-in — leave weight &amp; body fat out of calculations</span>
+              </label>
               <button onClick={handleSaveMorning}
-                disabled={morningForm.weight === "" && morningForm.bf === ""}
+                disabled={morningDisabled}
                 style={{
-                  width: "100%", background: (morningForm.weight === "" && morningForm.bf === "") ? "var(--border)" : "#8b5cf6",
-                  color: (morningForm.weight === "" && morningForm.bf === "") ? "var(--text-dim)" : "#fff",
+                  width: "100%", background: morningDisabled ? "var(--border)" : "#8b5cf6",
+                  color: morningDisabled ? "var(--text-dim)" : "#fff",
                   border: "none", borderRadius: 6, padding: "9px", fontSize: 12, fontWeight: 600,
                   letterSpacing: "0.04em", textTransform: "uppercase",
-                  cursor: (morningForm.weight === "" && morningForm.bf === "") ? "default" : "pointer",
+                  cursor: morningDisabled ? "default" : "pointer",
                 }}>
                 {morningLogged ? "Update Morning" : "Save Morning"}
               </button>
@@ -1970,11 +2424,28 @@ export default function App() {
             ))}
           </div>
 
-          {/* TDEE card with window toggle */}
+          {/* Approved TDEE — the value targets, macros and diet break use */}
+          <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 8, padding: "14px 16px", marginBottom: 14 }}>
+            <div style={{ fontSize: 9, letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--text-dim)", fontWeight: 600, marginBottom: 8 }}>Approved TDEE</div>
+            <div style={{ display: "flex", alignItems: "baseline", gap: 6, flexWrap: "wrap" }}>
+              <span style={{ fontSize: 24, fontWeight: 800, color: "#34d399", fontVariantNumeric: "tabular-nums", letterSpacing: "-0.02em" }}>
+                {effectiveTDEE != null ? effectiveTDEE.toLocaleString() : "—"}
+              </span>
+              <span style={{ fontSize: 11, color: "var(--text-muted)" }}>kcal/day</span>
+              <span style={{ fontSize: 10, color: "var(--text-dim)", marginLeft: 6 }}>
+                {tdeeState?.source === "migrated" ? "carried over from your measured estimate" : tdeeState?.source === "accepted" ? "approved by you" : "baseline estimate (Mifflin-St Jeor)"}
+              </span>
+            </div>
+            <div style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 6, lineHeight: 1.5 }}>
+              Used for phase targets, macros and diet break. It only changes when you approve an update.
+            </div>
+          </div>
+
+          {/* Measured estimate (information only) */}
           <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 8, padding: "14px 16px", marginBottom: 14 }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 8, flexWrap: "wrap" }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span style={{ fontSize: 9, letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--text-dim)", fontWeight: 600 }}>TDEE Estimate</span>
+                <span style={{ fontSize: 9, letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--text-dim)", fontWeight: 600 }}>Measured estimate · info only</span>
                 {tdeeConfidence && (
                   <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: "0.05em", color: tdeeConfidence === "high" ? "#34d399" : "#fbbf24" }}>
                     {tdeeConfidence === "high" ? "● STABLE" : "● NOISY"}
@@ -2038,7 +2509,7 @@ export default function App() {
                   )}
                 </div>
                 <div style={{ fontSize: 9, color: "var(--text-dim)", marginTop: 6, letterSpacing: "0.02em" }}>
-                  {tdeeSource === "baseline" && "Baseline estimate (Mifflin-St Jeor) — switches to measured TDEE after ~10 days. "}
+                  {tdeeSource === "baseline" && "Baseline estimate (Mifflin-St Jeor). "}
                   {cycle && !reviewDue && daysSinceAnchor != null && (
                     <span>🔒 Locked · day {daysSinceAnchor + 1} of {REVIEW_DAYS} — review in {REVIEW_DAYS - daysSinceAnchor} day{REVIEW_DAYS - daysSinceAnchor === 1 ? "" : "s"}.</span>
                   )}
@@ -2152,14 +2623,14 @@ export default function App() {
               <div style={{ fontSize: 10, color: "var(--text-soft)", lineHeight: 1.5, marginBottom: 10 }}>
                 Target set to maintenance. Eat at maintenance, reduce training intensity — hormones stabilise over 1–2 weeks.
               </div>
-              <button onClick={() => saveDietBreak(null)}
+              <button onClick={endDietBreak}
                 style={{ background: "transparent", color: "var(--text-muted)", border: "1px solid var(--border)", borderRadius: 6, padding: "6px 14px", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
                 End diet break
               </button>
             </div>
           ) : (
             <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", padding: "10px 0" }}>
-              <input type="checkbox" onChange={e => { if (e.target.checked) saveDietBreak({ active: true, startDate: today }); }}
+              <input type="checkbox" onChange={e => { if (e.target.checked) startDietBreak(); }}
                 style={{ accentColor: "#34d399", width: 15, height: 15 }} />
               <span style={{ fontSize: 12, color: "var(--text-soft)" }}>
                 Deload / diet break — switch to maintenance calories
@@ -2184,6 +2655,7 @@ export default function App() {
                 <tbody>
                   {displayRows.map((date, idx) => {
                     const e = parseEntry(entries[date]);
+                    const excl = validReading(entries[date]).excluded;
                     const isRecent = last7.some(r => r.date === date);
                     const rowTarget = targetForDate(date);
                     const rowPhase = phaseOnDate(date).phase;
@@ -2210,10 +2682,10 @@ export default function App() {
                             : <span style={{ color: "var(--text-faint)" }}>—</span>}
                         </td>
                         <td style={{ padding: "10px 12px", textAlign: "right", color: e.weight != null ? "var(--text)" : "var(--text-faint)", fontVariantNumeric: "tabular-nums" }}>
-                          {e.weight != null ? e.weight.toFixed(1) : "—"}
+                          {e.weight != null ? <span title={excl ? "Excluded: non-standard weigh-in" : undefined} style={excl ? { textDecoration: "line-through", opacity: 0.5 } : undefined}>{e.weight.toFixed(1)}</span> : "—"}
                         </td>
                         <td style={{ padding: "10px 12px", textAlign: "right", color: e.bf != null ? "var(--text)" : "var(--text-faint)", fontVariantNumeric: "tabular-nums" }}>
-                          {e.bf != null ? `${e.bf.toFixed(1)}%` : "—"}
+                          {e.bf != null ? <span title={excl ? "Excluded: non-standard weigh-in" : undefined} style={excl ? { textDecoration: "line-through", opacity: 0.5 } : undefined}>{`${e.bf.toFixed(1)}%`}</span> : "—"}
                         </td>
                         <td style={{ padding: "10px 12px", textAlign: "right" }}>
                           <button onClick={() => handleEdit(date)} style={{ background: "none", border: "none", color: "var(--text-dim)", cursor: "pointer", fontSize: 11, marginRight: 6, padding: "2px 5px" }}>Edit</button>
@@ -2228,6 +2700,11 @@ export default function App() {
             <div style={{ marginTop: 8, fontSize: 10, color: "var(--text-dim)" }}>
               "vs Target" uses the calorie target that was active on each date, based on your Phase History — not today's target.
             </div>
+            {displayRows.some(dt => validReading(entries[dt]).excluded) && (
+              <div style={{ marginTop: 4, fontSize: 10, color: "var(--text-dim)" }}>
+                Struck-through weight and body fat are marked non-standard and left out of all calculations.
+              </div>
+            )}
             {sorted.length > 30 && (
               <div style={{ marginTop: 4, fontSize: 10, color: "var(--text-dim)", textAlign: "right" }}>Showing 30 most recent of {sorted.length} entries.</div>
             )}
@@ -2582,7 +3059,7 @@ function MacrosView({ macros, target, tdee, phase, phaseInfo, magInfo, magnitude
     ? (calcMacros(whatIf, macroWeight, phase, magnitude) || macros)
     : macros;
   // Implied weekly weight change at the active intake: (cals - TDEE)/7700 * 7
-  const impliedRate = ((activeCals - tdee) / 7700) * 7; // kg/week
+  const impliedRate = ((activeCals - tdee) / KCAL_PER_KG) * 7; // kg/week
   const m2 = activeMacros;
 
   const macroCards = [
