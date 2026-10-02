@@ -12,6 +12,7 @@ const WATER_KEY = "body-tracker-water";
 const DIETBREAK_KEY = "body-tracker-diet-break";
 const TDEE_KEY = "body-tracker-tdee";
 const TDEEPARAMS_KEY = "body-tracker-tdee-params";
+const TARGETHIST_KEY = "body-tracker-target-hist";
 const DIETBREAKLOG_KEY = "body-tracker-diet-break-log";
 
 // Structural color tokens. Accent colors (phase/macro) are left as literal hex
@@ -917,6 +918,7 @@ export default function App() {
   const [previewTdee, setPreviewTdee] = useState(false);
   const [flagsOpen, setFlagsOpen] = useState(false);
   const [olderCount, setOlderCount] = useState(0);
+  const [targetHist, setTargetHist] = useState([]); // [{ date, target, kind? }] — the calorie target in force from each date
   const fileInputRef = useRef(null);
   const dateInputRef = useRef(null);
 
@@ -949,6 +951,8 @@ export default function App() {
       const dbl = store.get(DIETBREAKLOG_KEY);
       if (Array.isArray(dbl)) setDietBreakLog(dbl);
       const tpar = store.get(TDEEPARAMS_KEY);
+      const thist = store.get(TARGETHIST_KEY);
+      if (Array.isArray(thist)) setTargetHist(thist);
       if (tpar) setTdeeParams({ cap: tpar.cap ?? TDEE_DEFAULTS.cap, kcalPerKg: tpar.kcalPerKg ?? TDEE_DEFAULTS.kcalPerKg });
     } catch (_) {}
     setLoaded(true);
@@ -1021,13 +1025,25 @@ export default function App() {
   const saveDietBreak = (next) => { setDietBreakMode(next); store.set(DIETBREAK_KEY, next); };
   const saveTdeeState = (next) => { setTdeeState(next); store.set(TDEE_KEY, next); };
   const saveTdeeParams = (next) => { setTdeeParams(next); store.set(TDEEPARAMS_KEY, next); };
+  const saveTargetHist = (next) => { setTargetHist(next); store.set(TARGETHIST_KEY, next); };
+  // Append a target change (later records win for the same date). kind marks diet-break records so they can be removed with the break.
+  const recordTarget = (date, target, kind) => {
+    if (target == null) return;
+    const next = [...targetHist, { date, target, ...(kind ? { kind } : {}) }].sort((a, b) => a.date.localeCompare(b.date));
+    saveTargetHist(next);
+  };
+  // A new locked target. While a diet break is running the effective target stays at maintenance, so nothing is recorded;
+  // ending the break records the locked target.
+  const recordLockedTarget = (target) => { if (!dietBreakMode?.active) recordTarget(today, target); };
   const saveDietBreakLog = (next) => { setDietBreakLog(next); store.set(DIETBREAKLOG_KEY, next); };
   const startDietBreak = () => {
     saveDietBreak({ active: true, startDate: today });
+    recordTarget(today, maintenanceTarget, "diet_break");
     if (!dietBreakLog.some(b => b.end == null)) saveDietBreakLog([...dietBreakLog, { start: today, end: null }]);
   };
   const endDietBreak = () => {
     saveDietBreak(null);
+    recordTarget(today, baseTarget, "diet_break_end");
     saveDietBreakLog(dietBreakLog.map(b => b.end == null ? { ...b, end: today } : b));
   };
 
@@ -1043,7 +1059,7 @@ export default function App() {
     persistSettings(p, m);
     // New phase/intensity → start a fresh review cycle anchored today
     const nt = calcTarget(effectiveTDEE, p, m);
-    if (nt != null) saveCycle({ anchorDate: today, lockedTarget: nt, syncedPhaseDate: today });
+    if (nt != null) { saveCycle({ anchorDate: today, lockedTarget: nt, syncedPhaseDate: today }); recordLockedTarget(nt); }
     // Append to phase history (replace same-day record so toggling doesn't spam)
     if (changed) {
       const w = latestWeight;
@@ -1074,7 +1090,15 @@ export default function App() {
   const restorePhase = (rec) => {
     const pr = rec.prev;
     setPhase(pr.phase); setMagnitude(pr.magnitude); persistSettings(pr.phase, pr.magnitude);
-    if (pr.cycle) saveCycle(pr.cycle);
+    if (pr.cycle) {
+      saveCycle(pr.cycle);
+      // The reverted change (and anything after it) never happened as far as "vs Target" is concerned.
+      const kept = targetHist.filter(h => h.date < rec.date);
+      const restoredTarget = pr.cycle.lockedTarget;
+      const lastKept = kept.length ? kept[kept.length - 1] : null;
+      saveTargetHist(restoredTarget != null && lastKept?.target !== restoredTarget
+        ? [...kept, { date: rec.date, target: restoredTarget }] : kept);
+    }
     savePhaseHist(phaseHist.filter(h => h.date !== rec.date));
     showToast("Previous phase and target restored");
   };
@@ -1393,11 +1417,12 @@ export default function App() {
     return { phase: active.phase, magnitude: active.magnitude };
   };
   const historicalTargetCache = {};
+  const sortedTargetHist = [...targetHist].sort((a, b) => a.date.localeCompare(b.date));
   const targetForDate = (dateStr) => {
-    // Only show vs-target for dates within the current cycle
-    // Dates before the anchor were under a different target — show nothing
-    if (!cycle?.anchorDate || dateStr < cycle.anchorDate) return null;
-    return target;
+    // The target that was in force on that date: the latest record on or before it. Days before the first record show nothing.
+    let t = null;
+    for (const h of sortedTargetHist) { if (h.date <= dateStr) t = h.target; else break; }
+    return t;
   };
 
   // ── Report: resolved date range ──
@@ -1609,6 +1634,12 @@ export default function App() {
     });
   }, [loaded, tdeeState, measuredTDEE, baselineTDEE]);
 
+  // Existing users: start the target history from the current target (same days that showed "vs Target" before).
+  useEffect(() => {
+    if (!loaded || targetHist.length > 0) return;
+    if (cycle?.lockedTarget != null) saveTargetHist([{ date: cycle.anchorDate ?? today, target: cycle.lockedTarget }]);
+  }, [loaded, cycle, targetHist.length]);
+
   // A diet break already running before the log existed: record its start.
   useEffect(() => {
     if (!loaded) return;
@@ -1649,6 +1680,7 @@ export default function App() {
       syncedPhaseDate: latestPhaseChangeDate ?? cycle.syncedPhaseDate
     };
     saveCycle(newCycle);
+    recordLockedTarget(review.proposed);
     setReviewConfirming(false);
     showToast(review.delta === 0 ? "Cycle reset — holding target" : `Target → ${review.proposed.toLocaleString()} kcal`);
   };
@@ -1696,9 +1728,28 @@ export default function App() {
     // A new TDEE re-derives the daily target for the current phase (same formula as a phase change),
     // and restarts the 2-week calorie review so the two reviews never adjust the same period twice.
     const nt = calcTarget(nextState.currentTDEE, phase, magnitude);
-    if (nt != null) saveCycle({ anchorDate: today, lockedTarget: nt, syncedPhaseDate: latestPhaseChangeDate ?? cycle?.syncedPhaseDate ?? today });
+    if (nt != null) { saveCycle({ anchorDate: today, lockedTarget: nt, syncedPhaseDate: latestPhaseChangeDate ?? cycle?.syncedPhaseDate ?? today }); recordLockedTarget(nt); }
     setPreviewTdee(false);
     showToast(`TDEE → ${nextState.currentTDEE.toLocaleString()} kcal${nt != null ? ` · target ${nt.toLocaleString()}` : ""}`);
+  };
+  const removeDietBreak = (idx) => {
+    const b = dietBreakLog[idx];
+    if (!b || b.end == null) return;
+    saveDietBreakLog(dietBreakLog.filter((_, i) => i !== idx));
+    saveTargetHist(targetHist.filter(h => !((h.kind === "diet_break" && h.date === b.start) || (h.kind === "diet_break_end" && h.date === b.end))));
+    showToast("Diet break removed from history");
+  };
+  const requestRemoveDietBreak = (idx) => {
+    const b = dietBreakLog[idx];
+    if (!b || b.end == null) return;
+    setDialog({
+      title: "Remove this diet break?",
+      message: `${b.start} → ${b.end}\nThis only removes it from your history. TDEE reviews stop treating it as a break, and "vs Target" uses your normal target on those days. Your current phase and target don't change.`,
+      actions: [
+        { label: "Remove", style: "danger", onClick: () => { setDialog(null); removeDietBreak(idx); } },
+        { label: "Cancel", style: "ghost", onClick: () => setDialog(null) },
+      ],
+    });
   };
   const confirmAcceptTdee = () => {
     const a = tdeeAssessment;
@@ -1818,7 +1869,7 @@ export default function App() {
   const buildCSV = () => entriesToCSV(entries);
 
   const buildJSON = () => JSON.stringify(
-    { exported: new Date().toISOString(), phase, magnitude, tdeeWindow, profile, cycle, goal, phaseHist, tdeeState, dietBreakLog, dietBreakMode, waterLog, tdeeParams, entries },
+    { exported: new Date().toISOString(), phase, magnitude, tdeeWindow, profile, cycle, goal, phaseHist, tdeeState, dietBreakLog, dietBreakMode, waterLog, tdeeParams, targetHist, entries },
     null, 2
   );
 
@@ -2003,7 +2054,7 @@ export default function App() {
       try {
         const parsed = JSON.parse(text);
         imported = parsed.entries ?? parsed; // accept {entries,...} or bare map
-        if (parsed.phase || parsed.magnitude || parsed.tdeeWindow || parsed.profile || parsed.cycle || parsed.goal || parsed.phaseHist || parsed.tdeeState || parsed.dietBreakLog || parsed.waterLog || parsed.tdeeParams || parsed.dietBreakMode !== undefined) settings = parsed;
+        if (parsed.phase || parsed.magnitude || parsed.tdeeWindow || parsed.profile || parsed.cycle || parsed.goal || parsed.phaseHist || parsed.tdeeState || parsed.dietBreakLog || parsed.waterLog || parsed.tdeeParams || parsed.targetHist || parsed.dietBreakMode !== undefined) settings = parsed;
       } catch (_) { showToast("Invalid JSON file"); return; }
     } else {
       imported = csvToEntries(text);
@@ -2032,6 +2083,8 @@ export default function App() {
         if (Array.isArray(settings.dietBreakLog)) saveDietBreakLog(settings.dietBreakLog);
         if (settings.dietBreakMode !== undefined) saveDietBreak(settings.dietBreakMode);
         if (settings.waterLog) saveWater(settings.waterLog);
+        if (Array.isArray(settings.targetHist)) saveTargetHist(settings.targetHist);
+        else if (settings.cycle?.lockedTarget != null) saveTargetHist([{ date: settings.cycle.anchorDate ?? today, target: settings.cycle.lockedTarget }]);
         if (settings.tdeeParams) saveTdeeParams({ cap: settings.tdeeParams.cap ?? TDEE_DEFAULTS.cap, kcalPerKg: settings.tdeeParams.kcalPerKg ?? TDEE_DEFAULTS.kcalPerKg });
       }
       showToast(`Imported ${incomingCount} entries`);
@@ -2295,6 +2348,7 @@ export default function App() {
           <StatsView
             adherence={adherence} phaseHist={phaseHist}
             weekly={weekly} goalInfo={goalInfo} phase={phase} tdeeHistory={tdeeState?.history || []}
+            dietBreakLog={dietBreakLog} dietBreakActive={!!dietBreakMode?.active} onRemoveDietBreak={requestRemoveDietBreak}
             onDeletePhase={requestDeletePhase}
             onEditPhaseDate={(oldDate, newDate) => {
               if (newDate === oldDate) return;
@@ -3619,7 +3673,7 @@ const MAG_LABEL = {
   aggressive: "Aggressive", moderate: "Moderate", conservative: "Conservative", maintain: "Maintenance",
 };
 
-function StatsView({ adherence, phaseHist, onDeletePhase, onEditPhaseDate, weekly, goalInfo, phase, tdeeHistory = [] }) {
+function StatsView({ adherence, phaseHist, onDeletePhase, onEditPhaseDate, weekly, goalInfo, phase, tdeeHistory = [], dietBreakLog = [], dietBreakActive = false, onRemoveDietBreak }) {
   const [editingDate, setEditingDate] = useState(null); // the original date being edited
   const [editValue, setEditValue] = useState("");
   const sortedHist = [...(phaseHist || [])].sort((a, b) => b.date.localeCompare(a.date));
@@ -3807,6 +3861,35 @@ function StatsView({ adherence, phaseHist, onDeletePhase, onEditPhaseDate, weekl
       ) : (
         <div style={{ background: "var(--surface)", border: "1px dashed var(--border)", borderRadius: 8, padding: "32px 0", textAlign: "center", color: "var(--border-strong)", fontSize: 12 }}>
           Phase changes will be recorded here as you switch between bulk, cut, and maintain.
+        </div>
+      )}
+
+      {/* Diet breaks */}
+      <div style={{ fontSize: 10, letterSpacing: "0.12em", textTransform: "uppercase", color: "var(--text-dim)", fontWeight: 600, margin: "24px 0 12px" }}>Diet Breaks</div>
+      {dietBreakLog.length > 0 ? (
+        <div style={{ border: "1px solid var(--border)", borderRadius: 10, overflow: "hidden" }}>
+          {dietBreakLog.map((b, i) => ({ b, i })).reverse().map(({ b, i }, k, arr) => {
+            const active = b.end == null;
+            const days = Math.max(1, dayNum(active ? formatDate(new Date()) : b.end) - dayNum(b.start) + 1);
+            return (
+              <div key={b.start + i} style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 14px", borderBottom: k < arr.length - 1 ? "1px solid var(--surface-2)" : "none" }}>
+                <div style={{ width: 8, height: 8, borderRadius: 4, background: "#34d399", flexShrink: 0 }} />
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: "#34d399" }}>{active ? "Active now" : "Diet break / deload"}</div>
+                  <div style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 2, fontVariantNumeric: "tabular-nums" }}>
+                    {active ? `since ${b.start}` : `${b.start} → ${b.end}`} · {days} day{days === 1 ? "" : "s"}
+                  </div>
+                </div>
+                {!active && (
+                  <button onClick={() => onRemoveDietBreak(i)} aria-label="Remove diet break" style={{ background: "none", border: "none", color: "var(--border-strong)", cursor: "pointer", fontSize: 12 }}>✕</button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <div style={{ background: "var(--surface)", border: "1px dashed var(--border)", borderRadius: 8, padding: "28px 0", textAlign: "center", color: "var(--border-strong)", fontSize: 12 }}>
+          Diet breaks and deloads will be listed here.
         </div>
       )}
     </div>
