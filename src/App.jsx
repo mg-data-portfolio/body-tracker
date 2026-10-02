@@ -749,6 +749,8 @@ function recommendPhase(bf) {
   };
 }
 
+const phaseLabel = (p, m) => `${PHASES[p]?.label ?? p}${p !== "maintain" ? " · " + (PHASES[p]?.magnitudes.find(x => x.id === m)?.label || m) : ""}`;
+
 function calcTarget(tdee, phase, magnitudeId) {
   if (!tdee || !phase || !magnitudeId) return null;
   const mag = PHASES[phase]?.magnitudes.find(m => m.id === magnitudeId);
@@ -883,7 +885,7 @@ export default function App() {
   const [saveStatus, setSaveStatus] = useState("");
   const [phase, setPhase] = useState("cut");
   const [magnitude, setMagnitude] = useState("moderate");
-  const [view, setView] = useState("log");
+  const [view, setView] = useState("daily");
   const [range, setRange] = useState("month");
   const [reportRange, setReportRange] = useState("month");
   const [reportCustomStart, setReportCustomStart] = useState("");
@@ -914,6 +916,7 @@ export default function App() {
   const [tdeeParams, setTdeeParams] = useState({ cap: TDEE_DEFAULTS.cap, kcalPerKg: TDEE_DEFAULTS.kcalPerKg });
   const [previewTdee, setPreviewTdee] = useState(false);
   const [flagsOpen, setFlagsOpen] = useState(false);
+  const [olderCount, setOlderCount] = useState(0);
   const fileInputRef = useRef(null);
   const dateInputRef = useRef(null);
 
@@ -1044,9 +1047,62 @@ export default function App() {
     // Append to phase history (replace same-day record so toggling doesn't spam)
     if (changed) {
       const w = latestWeight;
+      const todays = phaseHist.find(h => h.date === today);
       const filtered = phaseHist.filter(h => h.date !== today);
-      savePhaseHist([...filtered, { date: today, phase: p, magnitude: m, weightKg: w ?? null }]);
+      // Remember the setup from before today's FIRST change, so it can be restored from Stats.
+      const prev = todays?.prev ?? { phase, magnitude, cycle };
+      savePhaseHist([...filtered, { date: today, phase: p, magnitude: m, weightKg: w ?? null, prev }]);
     }
+  };
+
+  // Every phase/intensity change asks first: it resets the target and restarts the review window.
+  const requestPhaseChange = (p, m) => {
+    if (p === phase && m === magnitude) return; // tapping what is already selected does nothing
+    const nt = calcTarget(effectiveTDEE, p, m);
+    setDialog({
+      title: "Change phase?",
+      message: `${phaseLabel(phase, magnitude)} → ${phaseLabel(p, m)}\n`
+        + (nt != null ? `Daily target ${baseTarget != null ? baseTarget.toLocaleString() : "—"} → ${nt.toLocaleString()} kcal.\n` : "")
+        + "This restarts your 2-week calorie review window. You can undo it afterwards by deleting the record in Stats → Phase History.",
+      actions: [
+        { label: "Change phase", style: "primary", onClick: () => { setDialog(null); setPhaseAndMag(p, m); } },
+        { label: "Cancel", style: "ghost", onClick: () => setDialog(null) },
+      ],
+    });
+  };
+
+  const restorePhase = (rec) => {
+    const pr = rec.prev;
+    setPhase(pr.phase); setMagnitude(pr.magnitude); persistSettings(pr.phase, pr.magnitude);
+    if (pr.cycle) saveCycle(pr.cycle);
+    savePhaseHist(phaseHist.filter(h => h.date !== rec.date));
+    showToast("Previous phase and target restored");
+  };
+  const requestDeletePhase = (date) => {
+    const rec = phaseHist.find(h => h.date === date);
+    const removeOnly = () => { setDialog(null); savePhaseHist(phaseHist.filter(h => h.date !== date)); showToast("Phase record removed"); };
+    const newest = [...phaseHist].sort((a, b) => b.date.localeCompare(a.date))[0]?.date;
+    if (!(rec?.prev && date === newest)) {
+      setDialog({
+        title: "Delete phase record?",
+        message: `Remove the phase change logged on ${date}? This only affects the history log — not your entries or your target.`,
+        actions: [
+          { label: "Delete", style: "danger", onClick: removeOnly },
+          { label: "Cancel", style: "ghost", onClick: () => setDialog(null) },
+        ],
+      });
+      return;
+    }
+    const pt = rec.prev.cycle?.lockedTarget;
+    setDialog({
+      title: "Delete phase record?",
+      message: `Restore your previous setup, or only remove the record?\n\nRestore: back to ${phaseLabel(rec.prev.phase, rec.prev.magnitude)}${pt != null ? ` with a target of ${pt.toLocaleString()} kcal` : ""} and your review window as it was. Any later target changes (a review or TDEE update) are undone.\n\nRemove only: your current phase and target stay as they are.`,
+      actions: [
+        { label: `Delete & restore${pt != null ? ` (target ${pt.toLocaleString()})` : ""}`, style: "primary", onClick: () => { setDialog(null); restorePhase(rec); } },
+        { label: "Delete record only", style: "danger", onClick: removeOnly },
+        { label: "Cancel", style: "ghost", onClick: () => setDialog(null) },
+      ],
+    });
   };
 
   // Save a partial set of fields into the active date (merge, never overwrite siblings)
@@ -1998,6 +2054,65 @@ export default function App() {
   };
 
 
+  // ── Daily Tracking history: 14 calendar days (empty days get a "Log" button), older entries on request ──
+  const logWindowDates = Array.from({ length: 14 }, (_, i) => addDaysStr(today, -i));
+  const logWindowStart = logWindowDates[logWindowDates.length - 1];
+  const olderLogged = [...sorted].reverse().filter(d => d < logWindowStart);
+  const olderShown = olderLogged.slice(0, olderCount);
+  const renderLogRow = (date, idx, total) => {
+    const raw = entries[date];
+    const empty = !raw;
+    const e = raw ? parseEntry(raw) : { calories: null, weight: null, bf: null, protein: null };
+    const excl = raw ? validReading(raw).excluded : false;
+    const isRecent = last7.some(r => r.date === date);
+    const rowTarget = raw ? targetForDate(date) : null;
+    const rowPhase = phaseOnDate(date).phase;
+    let calDiff = null, calColor = "var(--text-muted)";
+    if (e.calories != null && rowTarget != null) {
+      calDiff = Math.round(e.calories - rowTarget);
+      const over = calDiff > 0;
+      if (rowPhase === "cut") calColor = over ? "#f87171" : "#34d399";
+      else if (rowPhase === "bulk") calColor = over ? "#34d399" : "#f87171";
+      else calColor = Math.abs(calDiff) <= 100 ? "#34d399" : "#f87171";
+    }
+    const flagLabels = FLAG_OPTIONS.filter(f => (raw?.flags || []).includes(f.id)).map(f => f.label);
+    const dateLabel = new Date(date + "T00:00:00").toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" });
+    const exclStyle = excl ? { textDecoration: "line-through", opacity: 0.5 } : undefined;
+    return (
+      <tr key={date} style={{ borderBottom: idx < total - 1 ? "1px solid var(--surface-2)" : "none", background: activeDate === date && date !== today ? "var(--surface-2)" : "transparent" }}>
+        <td title={date} style={{ padding: "10px 12px", whiteSpace: "nowrap", color: empty ? "var(--text-dim)" : isRecent ? "var(--text)" : "var(--text-muted)", fontVariantNumeric: "tabular-nums" }}>
+          {date === today ? "Today" : dateLabel}
+          {isRecent && <span style={{ marginLeft: 6, fontSize: 8, color: "#6366f1", letterSpacing: "0.08em", fontWeight: 700 }}>7D</span>}
+          {flagLabels.length > 0 && <span title={flagLabels.join(", ")} style={{ marginLeft: 6, fontSize: 10, color: "#fbbf24" }}>⚑</span>}
+        </td>
+        <td style={{ padding: "10px 12px", textAlign: "right", color: e.calories != null ? "var(--text)" : "var(--text-faint)", fontVariantNumeric: "tabular-nums" }}>
+          {e.calories != null ? e.calories.toLocaleString() : "—"}
+        </td>
+        <td style={{ padding: "10px 12px", textAlign: "right", fontVariantNumeric: "tabular-nums", fontSize: 11 }}>
+          {calDiff != null
+            ? <span style={{ color: calColor }}>{calDiff > 0 ? "+" : ""}{calDiff}</span>
+            : <span style={{ color: "var(--text-faint)" }}>—</span>}
+        </td>
+        <td style={{ padding: "10px 12px", textAlign: "right", color: e.weight != null ? "var(--text)" : "var(--text-faint)", fontVariantNumeric: "tabular-nums" }}>
+          {e.weight != null ? <span title={excl ? "Excluded: non-standard weigh-in" : undefined} style={exclStyle}>{e.weight.toFixed(1)}</span> : "—"}
+        </td>
+        <td style={{ padding: "10px 12px", textAlign: "right", color: e.bf != null ? "var(--text)" : "var(--text-faint)", fontVariantNumeric: "tabular-nums" }}>
+          {e.bf != null ? <span title={excl ? "Excluded: non-standard weigh-in" : undefined} style={exclStyle}>{`${e.bf.toFixed(1)}%`}</span> : "—"}
+        </td>
+        <td style={{ padding: "10px 12px", textAlign: "right", whiteSpace: "nowrap" }}>
+          {empty ? (
+            <button onClick={() => handleEdit(date)} style={{ background: "none", border: "1px solid var(--border)", borderRadius: 6, color: "var(--text-soft)", cursor: "pointer", fontSize: 11, padding: "3px 10px" }}>Log</button>
+          ) : (
+            <>
+              <button onClick={() => handleEdit(date)} style={{ background: "none", border: "none", color: "var(--text-dim)", cursor: "pointer", fontSize: 11, marginRight: 6, padding: "2px 5px" }}>Edit</button>
+              <button onClick={() => handleDelete(date)} style={{ background: "none", border: "none", color: "var(--border-strong)", cursor: "pointer", fontSize: 11, padding: "2px 5px" }}>✕</button>
+            </>
+          )}
+        </td>
+      </tr>
+    );
+  };
+
   if (!loaded) return (
     <div style={{ minHeight: "100vh", background: "var(--bg)", display: "flex", alignItems: "center", justifyContent: "center" }}>
       <span style={{ color: "var(--text-muted)", fontFamily: "monospace", fontSize: 14 }}>Loading…</span>
@@ -2124,9 +2239,10 @@ export default function App() {
       )}
 
       {/* Tab switcher */}
-      <div style={{ borderBottom: "1px solid var(--border)", display: "flex", gap: 4, padding: "0 16px", maxWidth: 820, margin: "0 auto" }}>
+      <div style={{ borderBottom: "1px solid var(--border)", display: "flex", gap: 2, padding: "0 12px", maxWidth: 820, margin: "0 auto", overflowX: "auto", scrollbarWidth: "none" }}>
         {[
-          { id: "log", label: "Log & Targets" },
+          { id: "daily", label: "Daily" },
+          { id: "log", label: "Targets" },
           { id: "macros", label: "Macros" },
           { id: "trends", label: "Trends" },
           { id: "stats", label: "Stats" },
@@ -2137,7 +2253,7 @@ export default function App() {
             onClick={() => setView(t.id)}
             style={{
               background: "none", border: "none", cursor: "pointer",
-              padding: "14px 14px 12px", fontSize: 12, fontWeight: 600,
+              padding: "14px 11px 12px", fontSize: 12, fontWeight: 600, flexShrink: 0, whiteSpace: "nowrap",
               letterSpacing: "0.04em", color: view === t.id ? "var(--text)" : "var(--text-dim)",
               borderBottom: `2px solid ${view === t.id ? "#6366f1" : "transparent"}`,
               marginBottom: -1,
@@ -2171,14 +2287,7 @@ export default function App() {
           <StatsView
             adherence={adherence} phaseHist={phaseHist}
             weekly={weekly} goalInfo={goalInfo} phase={phase} tdeeHistory={tdeeState?.history || []}
-            onDeletePhase={(date) => setDialog({
-              title: "Delete phase record?",
-              message: `Remove the phase change logged on ${date}? This only affects the history log, not your entries.`,
-              actions: [
-                { label: "Delete", style: "danger", onClick: () => { setDialog(null); savePhaseHist(phaseHist.filter(h => h.date !== date)); showToast("Phase record removed"); } },
-                { label: "Cancel", style: "ghost", onClick: () => setDialog(null) },
-              ],
-            })}
+            onDeletePhase={requestDeletePhase}
             onEditPhaseDate={(oldDate, newDate) => {
               if (newDate === oldDate) return;
               if (phaseHist.some(h => h.date === newDate)) {
@@ -2205,7 +2314,7 @@ export default function App() {
             compLast={compLast}
           />
         )}
-        {view === "log" && (
+        {view === "daily" && (
         <>
 
         {/* ── Welcome-back banner after a gap ── */}
@@ -2404,6 +2513,74 @@ export default function App() {
           </div>
         </div>
 
+        {!isToday && (
+          <div style={{ marginTop: 20, fontSize: 10.5, color: "#fbbf24", lineHeight: 1.5 }}>
+            Hydration always tracks today, not the date selected above.
+          </div>
+        )}
+        {/* ── Hydration Tracker ── */}
+        <WaterLogger
+          date={today}
+          waterLog={waterLog}
+          latestWeight={latestWeight}
+          addWaterAmount={addWaterAmount}
+          toggleGymDay={toggleGymDay}
+          undoLastWater={undoLastWater}
+        />
+
+        {/* ── Last 14 days ── */}
+        <div>
+          <div style={{ fontSize: 10, letterSpacing: "0.12em", textTransform: "uppercase", color: "var(--text-dim)", fontWeight: 600, marginBottom: 12 }}>Last 14 days</div>
+          <div style={{ border: "1px solid var(--border)", borderRadius: 10, overflow: "hidden" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+              <thead>
+                <tr style={{ borderBottom: "1px solid var(--border)" }}>
+                  {["Date", "Calories", "vs Target", "Weight", "BF%", ""].map((h, i) => (
+                    <th key={i} style={{ padding: "10px 12px", textAlign: i === 0 ? "left" : "right", fontSize: 9, letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--text-dim)", fontWeight: 600, background: "var(--surface)" }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {logWindowDates.map((d, i) => renderLogRow(d, i, logWindowDates.length + olderShown.length))}
+                {olderShown.map((d, i) => renderLogRow(d, logWindowDates.length + i, logWindowDates.length + olderShown.length))}
+              </tbody>
+            </table>
+          </div>
+          <div style={{ marginTop: 8, fontSize: 10, color: "var(--text-dim)" }}>
+            "vs Target" uses the calorie target that was active on each date, based on your Phase History — not today's target.
+          </div>
+          {[...logWindowDates, ...olderShown].some(dt => entries[dt] && validReading(entries[dt]).excluded) && (
+            <div style={{ marginTop: 4, fontSize: 10, color: "var(--text-dim)" }}>
+              Struck-through weight and body fat are marked non-standard and left out of all calculations.
+            </div>
+          )}
+          <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
+            {olderLogged.length > olderShown.length && (
+              <button onClick={() => setOlderCount(c => c + 30)}
+                style={{ background: "transparent", color: "var(--text-soft)", border: "1px solid var(--border)", borderRadius: 6, padding: "7px 14px", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
+                Show older entries ({olderLogged.length - olderShown.length} more)
+              </button>
+            )}
+            {olderShown.length > 0 && (
+              <button onClick={() => setOlderCount(0)}
+                style={{ background: "transparent", color: "var(--text-muted)", border: "none", padding: "7px 8px", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
+                Hide older
+              </button>
+            )}
+          </div>
+        </div>
+
+        {sorted.length === 0 && (
+          <div style={{ textAlign: "center", padding: "48px 0", color: "var(--border-strong)" }}>
+            <div style={{ fontSize: 28, marginBottom: 12 }}>📊</div>
+            <div style={{ fontSize: 12, letterSpacing: "0.05em" }}>No entries yet. Log your first day above.</div>
+          </div>
+        )}
+        </>
+        )}
+        {view === "log" && (
+        <>
+
         {/* ── Review prompt (2-week cycle due) ── */}
         {review && (
           <div style={{ marginTop: 28, marginBottom: 4, background: "var(--surface)", border: "1px solid #fbbf2455", borderLeft: "3px solid #fbbf24", borderRadius: 8, padding: "14px 16px" }}>
@@ -2445,7 +2622,7 @@ export default function App() {
             <div style={{ fontSize: 11, color: "var(--text-soft)", lineHeight: 1.55, marginBottom: 10 }}>
               You've been cutting for about {Math.round(dietBreak.weeks)} weeks straight. The evidence (Helms; the MATADOR study) supports a planned <strong style={{ color: "var(--text)" }}>maintenance week</strong> every 6–8 weeks of continuous deficit — it helps restore hormones (leptin, thyroid), reduces fatigue, and improves long-term adherence and muscle retention. Eating at maintenance for ~7 days won't undo your progress.
             </div>
-            <button onClick={() => setPhaseAndMag("maintain", "maintain")}
+            <button onClick={() => requestPhaseChange("maintain", "maintain")}
               style={{ background: "#60a5fa", color: "#06121f", border: "none", borderRadius: 6, padding: "7px 14px", fontSize: 11, fontWeight: 700, letterSpacing: "0.03em", cursor: "pointer" }}>
               Switch to maintenance
             </button>
@@ -2458,7 +2635,7 @@ export default function App() {
             <div style={{ fontSize: 13, fontWeight: 700, color: rec.tone, letterSpacing: "0.01em" }}>{rec.headline}</div>
             {rec.phase && (rec.phase !== phase || rec.magnitude !== magnitude) && (
               <button
-                onClick={() => setPhaseAndMag(rec.phase, rec.magnitude)}
+                onClick={() => requestPhaseChange(rec.phase, rec.magnitude)}
                 style={{ background: "transparent", border: `1px solid ${rec.tone}`, color: rec.tone, borderRadius: 6, padding: "5px 12px", fontSize: 10, fontWeight: 600, letterSpacing: "0.05em", textTransform: "uppercase", cursor: "pointer" }}
               >
                 Apply
@@ -2484,7 +2661,7 @@ export default function App() {
                   key={key}
                   onClick={() => {
                     const defaultMag = key === "maintain" ? "maintain" : key === "cut" ? "moderate" : "moderate";
-                    setPhaseAndMag(key, defaultMag);
+                    if (key !== phase) requestPhaseChange(key, defaultMag);
                   }}
                   style={{
                     background: active ? info.color + "1a" : "var(--surface)",
@@ -2507,7 +2684,7 @@ export default function App() {
                 return (
                   <button
                     key={mag.id}
-                    onClick={() => setPhaseAndMag(phase, mag.id)}
+                    onClick={() => requestPhaseChange(phase, mag.id)}
                     style={{
                       background: active ? phaseInfo.color + "1a" : "transparent",
                       border: `1px solid ${active ? phaseInfo.color : "var(--border)"}`,
@@ -2704,16 +2881,6 @@ export default function App() {
         </div>
 
 
-        {/* ── Hydration Tracker ── */}
-        <WaterLogger
-          date={today}
-          waterLog={waterLog}
-          latestWeight={latestWeight}
-          addWaterAmount={addWaterAmount}
-          toggleGymDay={toggleGymDay}
-          undoLastWater={undoLastWater}
-        />
-
         {/* ── Diet Break / Deload ── */}
         <div style={{ marginBottom: 24 }}>
           {dietBreakMode?.active ? (
@@ -2743,84 +2910,6 @@ export default function App() {
           )}
         </div>
 
-        {/* ── Log Table ── */}
-        {displayRows.length > 0 && (
-          <div>
-            <div style={{ fontSize: 10, letterSpacing: "0.12em", textTransform: "uppercase", color: "var(--text-dim)", fontWeight: 600, marginBottom: 12 }}>Log</div>
-            <div style={{ border: "1px solid var(--border)", borderRadius: 10, overflow: "hidden" }}>
-              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
-                <thead>
-                  <tr style={{ borderBottom: "1px solid var(--border)" }}>
-                    {["Date", "Calories", "vs Target", "Weight", "BF%", ""].map((h, i) => (
-                      <th key={i} style={{ padding: "10px 12px", textAlign: i === 0 ? "left" : i === 5 ? "right" : "right", fontSize: 9, letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--text-dim)", fontWeight: 600, background: "var(--surface)" }}>{h}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {displayRows.map((date, idx) => {
-                    const e = parseEntry(entries[date]);
-                    const excl = validReading(entries[date]).excluded;
-                    const isRecent = last7.some(r => r.date === date);
-                    const rowTarget = targetForDate(date);
-                    const rowPhase = phaseOnDate(date).phase;
-                    let calDiff = null, calColor = "var(--text-muted)";
-                    if (e.calories != null && rowTarget != null) {
-                      calDiff = Math.round(e.calories - rowTarget);
-                      const over = calDiff > 0;
-                      if (rowPhase === "cut") calColor = over ? "#f87171" : "#34d399";
-                      else if (rowPhase === "bulk") calColor = over ? "#34d399" : "#f87171";
-                      else calColor = Math.abs(calDiff) <= 100 ? "#34d399" : "#f87171";
-                    }
-                    return (
-                      <tr key={date} style={{ borderBottom: idx < displayRows.length - 1 ? "1px solid var(--surface-2)" : "none", background: activeDate === date && date !== today ? "var(--surface-2)" : "transparent" }}>
-                        <td style={{ padding: "10px 12px", color: isRecent ? "var(--text)" : "var(--text-muted)", fontVariantNumeric: "tabular-nums" }}>
-                          {date}
-                          {isRecent && <span style={{ marginLeft: 6, fontSize: 8, color: "#6366f1", letterSpacing: "0.08em", fontWeight: 700 }}>7D</span>}
-                        </td>
-                        <td style={{ padding: "10px 12px", textAlign: "right", color: e.calories != null ? "var(--text)" : "var(--text-faint)", fontVariantNumeric: "tabular-nums" }}>
-                          {e.calories != null ? e.calories.toLocaleString() : "—"}
-                        </td>
-                        <td style={{ padding: "10px 12px", textAlign: "right", fontVariantNumeric: "tabular-nums", fontSize: 11 }}>
-                          {calDiff != null
-                            ? <span style={{ color: calColor }}>{calDiff > 0 ? "+" : ""}{calDiff}</span>
-                            : <span style={{ color: "var(--text-faint)" }}>—</span>}
-                        </td>
-                        <td style={{ padding: "10px 12px", textAlign: "right", color: e.weight != null ? "var(--text)" : "var(--text-faint)", fontVariantNumeric: "tabular-nums" }}>
-                          {e.weight != null ? <span title={excl ? "Excluded: non-standard weigh-in" : undefined} style={excl ? { textDecoration: "line-through", opacity: 0.5 } : undefined}>{e.weight.toFixed(1)}</span> : "—"}
-                        </td>
-                        <td style={{ padding: "10px 12px", textAlign: "right", color: e.bf != null ? "var(--text)" : "var(--text-faint)", fontVariantNumeric: "tabular-nums" }}>
-                          {e.bf != null ? <span title={excl ? "Excluded: non-standard weigh-in" : undefined} style={excl ? { textDecoration: "line-through", opacity: 0.5 } : undefined}>{`${e.bf.toFixed(1)}%`}</span> : "—"}
-                        </td>
-                        <td style={{ padding: "10px 12px", textAlign: "right" }}>
-                          <button onClick={() => handleEdit(date)} style={{ background: "none", border: "none", color: "var(--text-dim)", cursor: "pointer", fontSize: 11, marginRight: 6, padding: "2px 5px" }}>Edit</button>
-                          <button onClick={() => handleDelete(date)} style={{ background: "none", border: "none", color: "var(--border-strong)", cursor: "pointer", fontSize: 11, padding: "2px 5px" }}>✕</button>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-            <div style={{ marginTop: 8, fontSize: 10, color: "var(--text-dim)" }}>
-              "vs Target" uses the calorie target that was active on each date, based on your Phase History — not today's target.
-            </div>
-            {displayRows.some(dt => validReading(entries[dt]).excluded) && (
-              <div style={{ marginTop: 4, fontSize: 10, color: "var(--text-dim)" }}>
-                Struck-through weight and body fat are marked non-standard and left out of all calculations.
-              </div>
-            )}
-            {sorted.length > 30 && (
-              <div style={{ marginTop: 4, fontSize: 10, color: "var(--text-dim)", textAlign: "right" }}>Showing 30 most recent of {sorted.length} entries.</div>
-            )}
-          </div>
-        )}
-
-        {sorted.length === 0 && (
-          <div style={{ textAlign: "center", padding: "48px 0", color: "var(--border-strong)" }}>
-            <div style={{ fontSize: 28, marginBottom: 12 }}>📊</div>
-            <div style={{ fontSize: 12, letterSpacing: "0.05em" }}>No entries yet. Log your first day above.</div>
-          </div>
-        )}
         </>
         )}
       </div>
