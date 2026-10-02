@@ -2059,6 +2059,8 @@ export default function App() {
   const logWindowStart = logWindowDates[logWindowDates.length - 1];
   const olderLogged = [...sorted].reverse().filter(d => d < logWindowStart);
   const olderShown = olderLogged.slice(0, olderCount);
+  // Compact cell padding so the 6 columns fit a phone: 12px on the outer edges, 6px between columns
+  const logPad = (col) => col === 0 ? "10px 6px 10px 12px" : col === 5 ? "10px 12px 10px 6px" : "10px 6px";
   const renderLogRow = (date, idx, total) => {
     const raw = entries[date];
     const empty = !raw;
@@ -2076,36 +2078,42 @@ export default function App() {
       else calColor = Math.abs(calDiff) <= 100 ? "#34d399" : "#f87171";
     }
     const flagLabels = FLAG_OPTIONS.filter(f => (raw?.flags || []).includes(f.id)).map(f => f.label);
-    const dateLabel = new Date(date + "T00:00:00").toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" });
+    const dObj = new Date(date + "T00:00:00");
+    const dayMonth = dObj.toLocaleDateString(undefined, { day: "numeric", month: "short" });
+    const weekday = dObj.toLocaleDateString(undefined, { weekday: "short" });
     const exclStyle = excl ? { textDecoration: "line-through", opacity: 0.5 } : undefined;
+    const numCell = (v) => ({ padding: logPad(v), textAlign: "right", fontVariantNumeric: "tabular-nums" });
     return (
       <tr key={date} style={{ borderBottom: idx < total - 1 ? "1px solid var(--surface-2)" : "none", background: activeDate === date && date !== today ? "var(--surface-2)" : "transparent" }}>
-        <td title={date} style={{ padding: "10px 12px", whiteSpace: "nowrap", color: empty ? "var(--text-dim)" : isRecent ? "var(--text)" : "var(--text-muted)", fontVariantNumeric: "tabular-nums" }}>
-          {date === today ? "Today" : dateLabel}
-          {isRecent && <span style={{ marginLeft: 6, fontSize: 8, color: "#6366f1", letterSpacing: "0.08em", fontWeight: 700 }}>7D</span>}
-          {flagLabels.length > 0 && <span title={flagLabels.join(", ")} style={{ marginLeft: 6, fontSize: 10, color: "#fbbf24" }}>⚑</span>}
+        <td title={date} style={{ padding: logPad(0), whiteSpace: "nowrap", color: empty ? "var(--text-dim)" : isRecent ? "var(--text)" : "var(--text-muted)", fontVariantNumeric: "tabular-nums", lineHeight: 1.25 }}>
+          <div>{date === today ? "Today" : dayMonth}</div>
+          <div style={{ fontSize: 9.5, color: "var(--text-dim)", marginTop: 1 }}>
+            {weekday}
+            {isRecent && <span title="Counts toward your 7-day averages" style={{ display: "inline-block", width: 5, height: 5, borderRadius: 3, background: "#6366f1", marginLeft: 5, verticalAlign: "middle" }} />}
+            {flagLabels.length > 0 && <span title={flagLabels.join(", ")} style={{ marginLeft: 5, fontSize: 10, color: "#fbbf24" }}>⚑</span>}
+          </div>
         </td>
-        <td style={{ padding: "10px 12px", textAlign: "right", color: e.calories != null ? "var(--text)" : "var(--text-faint)", fontVariantNumeric: "tabular-nums" }}>
+        <td style={{ ...numCell(1), color: e.calories != null ? "var(--text)" : "var(--text-faint)" }}>
           {e.calories != null ? e.calories.toLocaleString() : "—"}
         </td>
-        <td style={{ padding: "10px 12px", textAlign: "right", fontVariantNumeric: "tabular-nums", fontSize: 11 }}>
+        <td style={{ ...numCell(2), fontSize: 11 }}>
           {calDiff != null
             ? <span style={{ color: calColor }}>{calDiff > 0 ? "+" : ""}{calDiff}</span>
             : <span style={{ color: "var(--text-faint)" }}>—</span>}
         </td>
-        <td style={{ padding: "10px 12px", textAlign: "right", color: e.weight != null ? "var(--text)" : "var(--text-faint)", fontVariantNumeric: "tabular-nums" }}>
+        <td style={{ ...numCell(3), color: e.weight != null ? "var(--text)" : "var(--text-faint)" }}>
           {e.weight != null ? <span title={excl ? "Excluded: non-standard weigh-in" : undefined} style={exclStyle}>{e.weight.toFixed(1)}</span> : "—"}
         </td>
-        <td style={{ padding: "10px 12px", textAlign: "right", color: e.bf != null ? "var(--text)" : "var(--text-faint)", fontVariantNumeric: "tabular-nums" }}>
+        <td style={{ ...numCell(4), color: e.bf != null ? "var(--text)" : "var(--text-faint)" }}>
           {e.bf != null ? <span title={excl ? "Excluded: non-standard weigh-in" : undefined} style={exclStyle}>{`${e.bf.toFixed(1)}%`}</span> : "—"}
         </td>
-        <td style={{ padding: "10px 12px", textAlign: "right", whiteSpace: "nowrap" }}>
+        <td style={{ padding: logPad(5), textAlign: "right", whiteSpace: "nowrap" }}>
           {empty ? (
-            <button onClick={() => handleEdit(date)} style={{ background: "none", border: "1px solid var(--border)", borderRadius: 6, color: "var(--text-soft)", cursor: "pointer", fontSize: 11, padding: "3px 10px" }}>Log</button>
+            <button onClick={() => handleEdit(date)} style={{ background: "none", border: "1px solid var(--border)", borderRadius: 6, color: "var(--text-soft)", cursor: "pointer", fontSize: 11, padding: "3px 8px" }}>Log</button>
           ) : (
             <>
-              <button onClick={() => handleEdit(date)} style={{ background: "none", border: "none", color: "var(--text-dim)", cursor: "pointer", fontSize: 11, marginRight: 6, padding: "2px 5px" }}>Edit</button>
-              <button onClick={() => handleDelete(date)} style={{ background: "none", border: "none", color: "var(--border-strong)", cursor: "pointer", fontSize: 11, padding: "2px 5px" }}>✕</button>
+              <button onClick={() => handleEdit(date)} style={{ background: "none", border: "none", color: "var(--text-dim)", cursor: "pointer", fontSize: 11, padding: "2px 4px" }}>Edit</button>
+              <button onClick={() => handleDelete(date)} aria-label="Delete entry" style={{ background: "none", border: "none", color: "var(--border-strong)", cursor: "pointer", fontSize: 11, padding: "2px 4px" }}>✕</button>
             </>
           )}
         </td>
@@ -2531,12 +2539,12 @@ export default function App() {
         {/* ── Last 14 days ── */}
         <div>
           <div style={{ fontSize: 10, letterSpacing: "0.12em", textTransform: "uppercase", color: "var(--text-dim)", fontWeight: 600, marginBottom: 12 }}>Last 14 days</div>
-          <div style={{ border: "1px solid var(--border)", borderRadius: 10, overflow: "hidden" }}>
+          <div style={{ border: "1px solid var(--border)", borderRadius: 10, overflowX: "auto" }}>
             <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
               <thead>
                 <tr style={{ borderBottom: "1px solid var(--border)" }}>
-                  {["Date", "Calories", "vs Target", "Weight", "BF%", ""].map((h, i) => (
-                    <th key={i} style={{ padding: "10px 12px", textAlign: i === 0 ? "left" : "right", fontSize: 9, letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--text-dim)", fontWeight: 600, background: "var(--surface)" }}>{h}</th>
+                  {["Date", "Kcal", "vs Target", "Kg", "BF%", ""].map((h, i) => (
+                    <th key={i} style={{ padding: logPad(i), textAlign: i === 0 ? "left" : "right", fontSize: 9, letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--text-dim)", fontWeight: 600, background: "var(--surface)" }}>{h}</th>
                   ))}
                 </tr>
               </thead>
