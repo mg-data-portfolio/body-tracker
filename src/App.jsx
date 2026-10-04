@@ -199,6 +199,7 @@ const FLAGS = {
   NON_STANDARD_WEIGHIN: "nonStandardWeighIn", // = exclusion of that day's weight AND body fat
   CALORIES_INCOMPLETE: "caloriesIncomplete",
   OTHER: "other",
+  DIDNT_GO: "didntGoBeforeWeighIn", // informational only: NOT a confounder day, never changes confidence or excludes a weight
   WEIGHT_CONFIRMED: "weightConfirmed", // internal: user confirmed this reading is real, so never ask again
 };
 
@@ -378,6 +379,7 @@ function assessReview({
   const illnessDays = countFlag(FLAGS.ILLNESS);
   const travelDays = countFlag(FLAGS.TRAVEL);
   const creatineDays = countFlag(FLAGS.CREATINE);
+  const noBowelDays = countFlag(FLAGS.DIDNT_GO); // informational only: never affects confidence
 
   // ── Phase / diet-break events inside the window (read-only) ──
   const inWin = (d) => d >= start && d <= end;
@@ -459,7 +461,7 @@ function assessReview({
 
   return {
     window: { start, end },
-    counts: { calorieDays, completeDays, validWeighIns, validWeek1, validWeek2, excludedWeighIns, incompleteRun, confounderDays, trainingDays, illnessDays, travelDays, creatineDays },
+    counts: { calorieDays, completeDays, validWeighIns, validWeek1, validWeek2, excludedWeighIns, incompleteRun, confounderDays, trainingDays, illnessDays, travelDays, creatineDays, noBowelDays },
     trend: { weeklyRate, weeklyPct, dailySurplus, scatterSd, meanWeight },
     avgCalories, rawTDEE, currentTDEE, gap,
     proposedTDEE, proposedChange, capped, smoothing, cap, isFirstReview,
@@ -587,6 +589,7 @@ const FLAG_OPTIONS = [
   { id: FLAGS.CREATINE, label: "Creatine change" },
   { id: FLAGS.ACTIVITY_CHANGED, label: "Activity changed" },
   { id: FLAGS.CALORIES_INCOMPLETE, label: "Calories incomplete" },
+  { id: FLAGS.DIDNT_GO, label: "Didn't go before weigh-in" },
   { id: FLAGS.OTHER, label: "Other" },
 ];
 
@@ -3997,6 +4000,11 @@ function TdeeReviewSection({ state, schedule, assessment, due, recheck, preview,
             ))}
             {a.isFirstReview && !a.escapeRoute && (
               <div style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 6 }}>First review: a larger step is allowed (50% of the gap, up to ±150 kcal).</div>
+            )}
+            {a.counts.noBowelDays >= 4 && (
+              <div style={{ fontSize: 10.5, color: "var(--text-soft)", lineHeight: 1.5, marginTop: 8, padding: "8px 10px", background: "var(--bg)", borderRadius: 8 }}>
+                "Didn't go before weigh-in" was flagged on {a.counts.noBowelDays} of 14 days. This review isn't treating those days differently yet. If you'd like it to, ask Claude to change how this flag is handled.
+              </div>
             )}
           </div>
 
