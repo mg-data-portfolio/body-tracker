@@ -755,6 +755,47 @@ function recommendPhase(bf) {
 
 const phaseLabel = (p, m) => `${PHASES[p]?.label ?? p}${p !== "maintain" ? " · " + (PHASES[p]?.magnitudes.find(x => x.id === m)?.label || m) : ""}`;
 
+// ── Mini phase planner (display only: never feeds targets, TDEE or reviews) ──
+const PLAN_COLOR = { cut: "#f87171", bulk: "#60a5fa", maintain: "#34d399" };
+const daysBetween = (a, b) => Math.round((new Date(b + "T00:00:00") - new Date(a + "T00:00:00")) / 86400000);
+
+// Phase start = latest phase-history record (else first logged day). Phase end = goal date.
+function buildPhasePlan({ phaseHist, entries, goal, today, dietBreakLog }) {
+  const hist = [...(phaseHist || [])].sort((a, b) => a.date.localeCompare(b.date));
+  const firstEntry = Object.keys(entries || {}).sort()[0] || null;
+  const latest = hist.length ? hist[hist.length - 1] : null;
+  const start = latest ? latest.date : firstEntry;
+  if (!start) return null;
+  const dayNum = Math.max(0, daysBetween(start, today));
+  const week = Math.floor(dayNum / 7) + 1;
+  const end = goal?.weightKg && goal?.date && goal.date > start ? goal.date : null;
+  const passed = end != null && today > end;
+  const totalDays = end ? daysBetween(start, end) : null;
+  const totalWeeks = totalDays != null ? Math.ceil(totalDays / 7) : null;
+  const weeksLeft = end && !passed ? Math.ceil(daysBetween(today, end) / 7) : null;
+
+  // Timeline: first phase record -> goal date (or today when there is no usable end)
+  const spanStart = hist.length ? hist[0].date : start;
+  const spanEnd = end && !passed ? end : today;
+  const spanDays = daysBetween(spanStart, spanEnd);
+  let segments = [], future = null, breaks = [];
+  if (spanDays > 0) {
+    const pct = (d) => Math.min(100, Math.max(0, (daysBetween(spanStart, d) / spanDays) * 100));
+    const recs = hist.length ? hist : [{ date: start, phase: null }];
+    segments = recs.map((h, i) => {
+      const from = pct(h.date);
+      const to = pct(i + 1 < recs.length ? recs[i + 1].date : today);
+      return { phase: h.phase, left: from, width: Math.max(0, to - from) };
+    }).filter(s => s.width > 0);
+    if (end && !passed) future = { left: pct(today), width: 100 - pct(today), phase: latest ? latest.phase : null };
+    breaks = (dietBreakLog || []).map(b => {
+      const from = pct(b.start), to = pct(b.end || today);
+      return { left: from, width: Math.max(1, to - from) };
+    }).filter(b => b.left < 100);
+  }
+  return { start, week, end, passed, totalWeeks, weeksLeft, segments, future, breaks, showBar: spanDays > 0 && (end != null || segments.length > 1) };
+}
+
 function calcTarget(tdee, phase, magnitudeId) {
   if (!tdee || !phase || !magnitudeId) return null;
   const mag = PHASES[phase]?.magnitudes.find(m => m.id === magnitudeId);
@@ -2882,6 +2923,51 @@ export default function App() {
             </div>
           )}
         </div>
+
+        {/* ── Phase planner (display only) ── */}
+        {(() => {
+          const plan = buildPhasePlan({ phaseHist, entries, goal, today, dietBreakLog });
+          if (!plan) return null;
+          const color = PLAN_COLOR[phase] || "#8b5cf6";
+          const fmt = (s) => new Date(s + "T00:00:00").toLocaleDateString("en-IE", { day: "numeric", month: "short" });
+          let finish = null;
+          if (plan.end && !plan.passed && goalInfo) {
+            finish = goalInfo.atGoal ? { t: "At goal weight", c: "#34d399" }
+              : goalInfo.onPace == null ? { t: "Log more weigh-ins to assess pace", c: "var(--text-dim)" }
+              : goalInfo.onPace ? { t: "On pace for goal date ✓", c: "#34d399" }
+              : { t: "Behind pace for goal date", c: "#fbbf24" };
+          }
+          return (
+            <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10, padding: "14px 16px", marginBottom: 16 }}>
+              <div style={{ fontSize: 10, letterSpacing: "0.12em", textTransform: "uppercase", color: "var(--text-dim)", fontWeight: 600, marginBottom: 8 }}>Phase planner</div>
+              <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+                <span style={{ fontSize: 14, fontWeight: 700, color }}>{(() => { const l = phaseLabel(phase, magnitude); const m = PHASES[phase]?.magnitudes.find(x => x.id === magnitude)?.label; return m && m.toLowerCase().includes((PHASES[phase]?.label || "").toLowerCase()) ? m : l; })()}</span>
+                <span style={{ fontSize: 12, color: "var(--text)", fontVariantNumeric: "tabular-nums" }}>
+                  {plan.end && !plan.passed ? `Week ${plan.week} of ${Math.max(plan.totalWeeks, plan.week)}` : `Week ${plan.week}`}
+                </span>
+              </div>
+              {plan.showBar && (
+                <div style={{ position: "relative", height: 8, borderRadius: 4, background: "var(--bg)", overflow: "hidden", marginTop: 10 }}>
+                  {plan.segments.map((s, i) => (
+                    <div key={i} style={{ position: "absolute", top: 0, bottom: 0, left: `${s.left}%`, width: `${s.width}%`, background: PLAN_COLOR[s.phase] || color }} />
+                  ))}
+                  {plan.future && plan.future.width > 0 && (
+                    <div style={{ position: "absolute", top: 0, bottom: 0, left: `${plan.future.left}%`, width: `${plan.future.width}%`, background: PLAN_COLOR[plan.future.phase] || color, opacity: 0.25 }} />
+                  )}
+                  {plan.breaks.map((b, i) => (
+                    <div key={"b" + i} style={{ position: "absolute", top: 0, bottom: 0, left: `${b.left}%`, width: `${b.width}%`, minWidth: 2, background: "#fbbf24" }} />
+                  ))}
+                </div>
+              )}
+              <div style={{ marginTop: 8, fontSize: 11, color: "var(--text-muted)", lineHeight: 1.5 }}>
+                {plan.end && !plan.passed && <>{plan.weeksLeft} {plan.weeksLeft === 1 ? "week" : "weeks"} left · goal date {fmt(plan.end)}</>}
+                {plan.passed && <>Goal date ({fmt(plan.end)}) has passed. Edit your goal to set a new one.</>}
+                {!plan.end && !plan.passed && <>Started {fmt(plan.start)}. Set a goal date to see weeks remaining.</>}
+              </div>
+              {finish && <div style={{ marginTop: 4, fontSize: 11, fontWeight: 600, color: finish.c }}>{finish.t}</div>}
+            </div>
+          );
+        })()}
 
         {/* ── Goal card ── */}
         <div style={{ marginBottom: 28 }}>
