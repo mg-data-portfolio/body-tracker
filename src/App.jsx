@@ -115,6 +115,8 @@ const formatDate = (d) => {
   return `${y}-${m}-${day}`;
 };
 const today = formatDate(new Date());
+// "Mon 19 Oct" style label for a YYYY-MM-DD string
+const fmtDayDate = (s) => new Date(s + "T00:00:00").toLocaleDateString("en-IE", { weekday: "short", day: "numeric", month: "short" });
 
 // Add N days (can be negative) to a YYYY-MM-DD string, returning a YYYY-MM-DD string.
 const addDaysStr = (dateStr, n) => {
@@ -173,6 +175,7 @@ const TDEE_DEFAULTS = {
   roundTo: 5,
   snoozeDays: 7,        // Defer
   reviewEveryDays: 14,
+  reviewWeekday: 1,     // reviews fall due on this weekday (0 = Sun … 6 = Sat, 1 = Monday); null = exactly reviewEveryDays
   // weigh-in flagging
   suspectAbsKg: 1.0,
   suspectPct: 1.5,
@@ -477,7 +480,13 @@ function assessReview({
 // status: "countdown" | "due" | "rechecking" | "snoozed"
 function reviewSchedule({ lastEventDate, snoozedUntil = null, today, lastConfidence = null, params = {} }) {
   const p = { ...TDEE_DEFAULTS, ...params };
-  const dueDate = addDays(lastEventDate, p.reviewEveryDays);
+  let dueDate = addDays(lastEventDate, p.reviewEveryDays);
+  if (p.reviewWeekday != null) {
+    // Roll forward to the next chosen weekday (on or after the 14-day mark) so reviews start the week.
+    // dayNum 0 = Thursday 1 Jan 1970, so weekday = (dayNum + 4) % 7 with Sunday = 0.
+    const wd = (dayNum(dueDate) + 4) % 7;
+    dueDate = addDays(dueDate, (p.reviewWeekday - wd + 7) % 7);
+  }
   if (snoozedUntil && today < snoozedUntil) return { status: "snoozed", until: snoozedUntil, dueDate };
   if (today < dueDate) return { status: "countdown", daysLeft: dayNum(dueDate) - dayNum(today), dueDate };
   return { status: lastConfidence === "red" ? "rechecking" : "due", dueDate };
@@ -1123,7 +1132,7 @@ export default function App() {
       title: "Change phase?",
       message: `${phaseLabel(phase, magnitude)} → ${phaseLabel(p, m)}\n`
         + (nt != null ? `Daily target ${baseTarget != null ? baseTarget.toLocaleString() : "—"} → ${nt.toLocaleString()} kcal.\n` : "")
-        + "This restarts your 2-week calorie review window. You can undo it afterwards by deleting the record in Stats → Phase History.",
+        + `Your weight-trend check restarts from today; your next review stays ${tdeeSched ? fmtDayDate(tdeeSched.dueDate) : "on schedule"}. You can undo this afterwards by deleting the record in Stats → Phase History.`,
       actions: [
         { label: "Change phase", style: "primary", onClick: () => { setDialog(null); setPhaseAndMag(p, m); } },
         { label: "Cancel", style: "ghost", onClick: () => setDialog(null) },
@@ -1349,41 +1358,6 @@ export default function App() {
   const baseTarget = (cycle && cycle.lockedTarget != null) ? cycle.lockedTarget : formulaTarget;
   const maintenanceTarget = effectiveTDEE ? Math.round(effectiveTDEE / 25) * 25 : baseTarget;
   const target = dietBreakMode?.active ? maintenanceTarget : baseTarget;
-
-  // Compute the review proposal when due
-  let review = null;
-  if (reviewDue && cycle && effectiveTDEE != null && phase !== "maintain") {
-    // actual weight rate over the cycle window (kg/week) via regression
-    const winStart = new Date(effectiveAnchorDate + "T00:00:00").getTime();
-    const wPts = datedAll.filter(d => d.weight != null && d.ts >= winStart).map(d => ({ x: d.ts, y: d.weight }));
-    const reg = wPts.length >= 4 ? linReg(wPts) : null;
-    const actualPerWeek = reg ? reg.slope * 7 * 86400000 : null;
-    // goal rate (kg/week) from phase % of bodyweight (midpoint of the band)
-    const goalPerWeek = goalRatePerWeek(phase, magnitude, macroWeight);
-    if (actualPerWeek != null && goalPerWeek != null) {
-      const offBy = actualPerWeek - goalPerWeek; // +ve = losing too slow (cut) / gaining too fast (bulk)
-      // Decide direction of calorie change
-      let delta = 0;
-      const tol = 0.1; // kg/week tolerance — within this, hold
-      if (phase === "cut") {
-        // want negative goal; if actual loss slower than goal (actual > goal), cut calories
-        if (actualPerWeek > goalPerWeek + tol) delta = -ADJUST_STEP;
-        else if (actualPerWeek < goalPerWeek - tol) delta = +ADJUST_STEP;
-      } else { // bulk
-        if (actualPerWeek < goalPerWeek - tol) delta = +ADJUST_STEP;
-        else if (actualPerWeek > goalPerWeek + tol) delta = -ADJUST_STEP;
-      }
-      // Review uses the SAME target variable as daily display — single source of truth
-      // This ensures consistency: both show the same "current" value
-      review = {
-        actualPerWeek, goalPerWeek, offBy, delta,
-        current: target,
-        proposed: target + delta,
-        onTrack: delta === 0,
-        weighIns: wPts.length,
-      };
-    }
-  }
 
   const macros = calcMacros(target, macroWeight, phase, magnitude);
 
@@ -1733,7 +1707,7 @@ export default function App() {
   };
   const holdReview = () => {
     if (!cycle) return;
-    saveCycle({ anchorDate: today, lockedTarget: target, syncedPhaseDate: latestPhaseChangeDate ?? cycle.syncedPhaseDate });
+    saveCycle({ anchorDate: today, lockedTarget: baseTarget, syncedPhaseDate: latestPhaseChangeDate ?? cycle.syncedPhaseDate });
     showToast("Holding current target");
   };
 
@@ -1751,8 +1725,40 @@ export default function App() {
       })
     : null;
   const tdeeRechecking = tdeeDue && tdeeAssessment?.confidence === "red";
-  const reviewAttention = !!review || (tdeeDue && tdeeAssessment != null && tdeeAssessment.confidence !== "red");
   const targetIfAccepted = tdeeAssessment?.proposedTDEE != null ? calcTarget(tdeeAssessment.proposedTDEE, phase, magnitude) : null;
+
+  // ── Weight trend vs plan (the old "2-week calorie review", now a section of the single review card) ──
+  // Measured over the same window as the TDEE review, but never reaching back before the latest phase change.
+  // Hidden once actioned (Apply / Hold / Keep+choice) until the next review falls due.
+  const trendDone = tdeeDue && cycle?.anchorDate != null && tdeeSched?.dueDate != null && cycle.anchorDate >= tdeeSched.dueDate;
+  let review = null;
+  if (tdeeAssessment && !trendDone && cycle && effectiveTDEE != null && phase !== "maintain") {
+    const from = latestPhaseChangeDate && latestPhaseChangeDate > tdeeAssessment.window.start ? latestPhaseChangeDate : tdeeAssessment.window.start;
+    const wPts = datedAll.filter(d => d.weight != null && d.date >= from && d.date <= tdeeAssessment.window.end).map(d => ({ x: d.ts, y: d.weight }));
+    const reg = wPts.length >= 4 ? linReg(wPts) : null;
+    const actualPerWeek = reg ? reg.slope * 7 * 86400000 : null;
+    const goalPerWeek = goalRatePerWeek(phase, magnitude, macroWeight); // kg/week from the phase band midpoint
+    if (actualPerWeek != null && goalPerWeek != null) {
+      let delta = 0;
+      const tol = 0.1; // kg/week tolerance: within this, hold
+      if (phase === "cut") {
+        if (actualPerWeek > goalPerWeek + tol) delta = -ADJUST_STEP;
+        else if (actualPerWeek < goalPerWeek - tol) delta = +ADJUST_STEP;
+      } else { // bulk
+        if (actualPerWeek < goalPerWeek - tol) delta = +ADJUST_STEP;
+        else if (actualPerWeek > goalPerWeek + tol) delta = -ADJUST_STEP;
+      }
+      review = {
+        actualPerWeek, goalPerWeek, delta,
+        current: baseTarget,
+        proposed: baseTarget + delta,
+        onTrack: delta === 0,
+        weighIns: wPts.length,
+        from,
+      };
+    }
+  }
+  const reviewAttention = tdeeDue && ((tdeeAssessment != null && tdeeAssessment.confidence !== "red") || (review != null && !review.onTrack));
 
   const updateDayFlags = async (date, patch) => {
     const prev = entries[date] || {};
@@ -1802,18 +1808,42 @@ export default function App() {
       title: "Update your TDEE?",
       message: `TDEE ${a.currentTDEE.toLocaleString()} → ${a.proposedTDEE.toLocaleString()} kcal (${a.proposedChange >= 0 ? "+" : ""}${a.proposedChange}).\n`
         + (targetIfAccepted != null ? `Your daily target is recalculated for your current phase: ${(baseTarget ?? 0).toLocaleString()} → ${targetIfAccepted.toLocaleString()} kcal.\n` : "")
-        + "Your 2-week calorie review window restarts today.",
+        + `The weight-trend check is covered by this update. Your next review is ${fmtDayDate(reviewSchedule({ lastEventDate: today, today }).dueDate)}.`,
       actions: [
         { label: "Update TDEE", style: "primary", onClick: () => { setDialog(null); acceptTdee(); } },
         { label: "Cancel", style: "ghost", onClick: () => setDialog(null) },
       ],
     });
   };
-  const keepTdee = () => {
+  // Keep the TDEE. trendChoice: "apply" = also take the weight-trend step, "hold" = keep the target as it is.
+  const keepTdee = (trendChoice = "hold") => {
     if (!tdeeState || !tdeeAssessment) return;
     saveTdeeState(applyDecision(tdeeState, "keep", tdeeAssessment, today));
+    if (cycle) {
+      const locked = trendChoice === "apply" && review ? review.proposed : baseTarget;
+      saveCycle({ anchorDate: today, lockedTarget: locked, syncedPhaseDate: latestPhaseChangeDate ?? cycle.syncedPhaseDate });
+      if (trendChoice === "apply" && review && review.delta !== 0) recordLockedTarget(review.proposed);
+    }
     setPreviewTdee(false);
-    showToast("TDEE kept — next review in 14 days");
+    const next = reviewSchedule({ lastEventDate: today, today }).dueDate;
+    showToast(trendChoice === "apply" && review && review.delta !== 0
+      ? `TDEE kept · target → ${review.proposed.toLocaleString()} kcal · next review ${fmtDayDate(next)}`
+      : `TDEE kept — next review ${fmtDayDate(next)}`);
+  };
+  // Keep current: when the weight trend suggests a target step, ask what to do with it in the same decision.
+  const confirmKeepTdee = () => {
+    if (!tdeeAssessment) return;
+    if (!review || review.onTrack) { keepTdee("hold"); return; }
+    setDialog({
+      title: "Keep your TDEE",
+      message: `Your weight is moving ${review.actualPerWeek >= 0 ? "+" : ""}${review.actualPerWeek.toFixed(2)} kg/wk against a goal of ${review.goalPerWeek >= 0 ? "+" : ""}${review.goalPerWeek.toFixed(2)}.\n`
+        + `What should happen to your daily target?\n${review.current.toLocaleString()} → ${review.proposed.toLocaleString()} kcal (${review.delta > 0 ? "+" : ""}${review.delta}), or stay at ${review.current.toLocaleString()}.`,
+      actions: [
+        { label: `Keep TDEE · set target ${review.proposed.toLocaleString()}`, style: "primary", onClick: () => { setDialog(null); keepTdee("apply"); } },
+        { label: `Keep TDEE · hold target ${review.current.toLocaleString()}`, style: "ghost", onClick: () => { setDialog(null); keepTdee("hold"); } },
+        { label: "Cancel", style: "ghost", onClick: () => setDialog(null) },
+      ],
+    });
   };
   const deferTdee = () => {
     if (!tdeeState || !tdeeAssessment) return;
@@ -2687,40 +2717,6 @@ export default function App() {
         {view === "log" && (
         <>
 
-        {/* ── Review prompt (2-week cycle due) ── */}
-        {review && (
-          <div style={{ marginTop: 28, marginBottom: 4, background: "var(--surface)", border: "1px solid #fbbf2455", borderLeft: "3px solid #fbbf24", borderRadius: 8, padding: "14px 16px" }}>
-            <div style={{ fontSize: 12, fontWeight: 700, color: "#fbbf24", marginBottom: 8 }}>2-week review ready</div>
-            <div style={{ fontSize: 11, color: "var(--text-soft)", lineHeight: 1.55, marginBottom: 10 }}>
-              Over the last {REVIEW_DAYS} days your weight moved {review.actualPerWeek >= 0 ? "+" : ""}{review.actualPerWeek.toFixed(2)} kg/wk
-              {" "}(goal {review.goalPerWeek >= 0 ? "+" : ""}{review.goalPerWeek.toFixed(2)} kg/wk, from {review.weighIns} weigh-ins).{" "}
-              {review.onTrack
-                ? "You're on track — no change needed."
-                : `Suggest ${review.delta > 0 ? "adding" : "cutting"} ${Math.abs(review.delta)} kcal: ${review.current.toLocaleString()} → ${review.proposed.toLocaleString()} kcal/day.`}
-            </div>
-            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-              {!review.onTrack && (
-                <>
-                  <button onClick={acceptReview}
-                    style={{ background: reviewConfirming ? "#dc2626" : "#fbbf24", color: reviewConfirming ? "#fff" : "var(--surface)", border: "none", borderRadius: 6, padding: "7px 14px", fontSize: 11, fontWeight: 700, letterSpacing: "0.03em", cursor: "pointer", transition: "all 150ms" }}>
-                    {reviewConfirming ? "Confirm — lock in?" : `Apply ${review.proposed.toLocaleString()}`}
-                  </button>
-                  {reviewConfirming && (
-                    <button onClick={cancelReviewConfirm}
-                      style={{ background: "transparent", color: "var(--text-soft)", border: "1px solid var(--border-strong)", borderRadius: 6, padding: "7px 14px", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
-                      Cancel
-                    </button>
-                  )}
-                </>
-              )}
-              <button onClick={review.onTrack ? acceptReview : holdReview}
-                style={{ background: review.onTrack ? "#34d399" : "transparent", color: review.onTrack ? "var(--bg)" : "var(--text-soft)", border: review.onTrack ? "none" : "1px solid var(--border-strong)", borderRadius: 6, padding: "7px 14px", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
-                {review.onTrack ? "Start next cycle" : "Hold current"}
-              </button>
-            </div>
-          </div>
-        )}
-
         {/* ── Diet-break suggestion (long cut) ── */}
         {dietBreak?.due && (
           <div style={{ marginTop: 28, marginBottom: 4, background: "var(--surface)", border: "1px solid #60a5fa55", borderLeft: "3px solid #60a5fa", borderRadius: 8, padding: "14px 16px" }}>
@@ -2871,7 +2867,9 @@ export default function App() {
               due={tdeeDue} recheck={tdeeRechecking}
               preview={previewTdee} setPreview={setPreviewTdee}
               targetNow={baseTarget} targetIfAccepted={targetIfAccepted}
-              onAccept={confirmAcceptTdee} onKeep={keepTdee} onDefer={deferTdee}
+              trend={review} trendConfirming={reviewConfirming}
+              onApplyTrend={acceptReview} onCancelTrend={cancelReviewConfirm} onHoldTrend={holdReview}
+              onAccept={confirmAcceptTdee} onKeep={confirmKeepTdee} onDefer={deferTdee}
               onExplain={explainTraffic}
               onReviewNow={() => saveTdeeState({ ...tdeeState, snoozedUntil: null })}
               onWeightExclude={(d) => updateDayFlags(d, { [FLAGS.NON_STANDARD_WEIGHIN]: true })}
@@ -2902,10 +2900,13 @@ export default function App() {
                 </div>
                 <div style={{ fontSize: 9, color: "var(--text-dim)", marginTop: 6, letterSpacing: "0.02em" }}>
                   {tdeeSource === "baseline" && "Baseline estimate (Mifflin-St Jeor). "}
-                  {cycle && !reviewDue && daysSinceAnchor != null && (
-                    <span>🔒 Locked · day {daysSinceAnchor + 1} of {REVIEW_DAYS} — review in {REVIEW_DAYS - daysSinceAnchor} day{REVIEW_DAYS - daysSinceAnchor === 1 ? "" : "s"}.</span>
+                  {tdeeSched && tdeeSched.status === "countdown" && (
+                    <span>🔒 Locked · next review {fmtDayDate(tdeeSched.dueDate)} ({tdeeSched.daysLeft} day{tdeeSched.daysLeft === 1 ? "" : "s"}).</span>
                   )}
-                  {reviewDue && <span style={{ color: "#fbbf24" }}>Review ready — see prompt above.</span>}
+                  {tdeeSched && tdeeSched.status === "snoozed" && (
+                    <span>🔒 Locked · review snoozed until {fmtDayDate(tdeeSched.until)}.</span>
+                  )}
+                  {tdeeDue && <span style={{ color: "#fbbf24" }}>Review ready — see the review card above.</span>}
                 </div>
               </div>
               {rateLabel && (
@@ -3993,7 +3994,7 @@ const CONF_META = {
 };
 const DECISION_LABEL = { accept: "Accepted", keep: "Kept current", auto_keep: "Kept (automatic)" };
 
-function TdeeReviewSection({ state, schedule, assessment, due, recheck, preview, setPreview, targetNow, targetIfAccepted, onAccept, onKeep, onDefer, onExplain, onReviewNow, onWeightExclude, onWeightConfirm }) {
+function TdeeReviewSection({ state, schedule, assessment, due, recheck, preview, setPreview, targetNow, targetIfAccepted, trend, trendConfirming, onApplyTrend, onCancelTrend, onHoldTrend, onAccept, onKeep, onDefer, onExplain, onReviewNow, onWeightExclude, onWeightConfirm }) {
   const fmtD = (s) => new Date(s + "T00:00:00").toLocaleDateString(undefined, { day: "numeric", month: "short" });
   const a = assessment;
   const showPanel = a != null && (due || preview);
@@ -4012,8 +4013,9 @@ function TdeeReviewSection({ state, schedule, assessment, due, recheck, preview,
   );
 
   let status;
-  if (schedule.status === "countdown") status = `Next review in ${schedule.daysLeft} day${schedule.daysLeft === 1 ? "" : "s"} · ${fmtD(schedule.dueDate)}`;
-  else if (schedule.status === "snoozed") status = `Review snoozed until ${fmtD(schedule.until)}`;
+  const fmtDW = (s) => new Date(s + "T00:00:00").toLocaleDateString("en-IE", { weekday: "short", day: "numeric", month: "short" });
+  if (schedule.status === "countdown") status = `Next review ${fmtDW(schedule.dueDate)} · in ${schedule.daysLeft} day${schedule.daysLeft === 1 ? "" : "s"}`;
+  else if (schedule.status === "snoozed") status = `Review snoozed until ${fmtDW(schedule.until)}`;
   else if (recheck) status = "Re-checking daily — your data isn't reliable enough yet";
   else status = "Review due now";
 
@@ -4021,7 +4023,7 @@ function TdeeReviewSection({ state, schedule, assessment, due, recheck, preview,
     <div style={{ background: "var(--surface)", border: `1px solid ${showPanel && meta ? meta.color + "55" : "var(--border)"}`, borderRadius: 8, padding: "14px 16px", marginBottom: 14 }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
         <div>
-          <div style={{ fontSize: 9, letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--text-dim)", fontWeight: 600, marginBottom: 5 }}>TDEE review</div>
+          <div style={{ fontSize: 9, letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--text-dim)", fontWeight: 600, marginBottom: 5 }}>Review · TDEE &amp; weight trend</div>
           <div style={{ fontSize: 12.5, fontWeight: 600, color: due ? "#fbbf24" : "var(--text)" }}>{status}</div>
           {last && (
             <div style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 3 }}>
@@ -4076,6 +4078,34 @@ function TdeeReviewSection({ state, schedule, assessment, due, recheck, preview,
               a.proposedChange != null ? `${a.proposedChange >= 0 ? "+" : ""}${a.proposedChange} kcal${a.capped ? " (capped)" : ""}` : null, meta.color)}
           </div>
 
+          {trend && (
+            <div style={{ background: "var(--bg)", borderRadius: 8, padding: "10px 12px", marginBottom: 12 }}>
+              <div style={{ fontSize: 9, letterSpacing: "0.08em", textTransform: "uppercase", color: "var(--text-dim)", fontWeight: 600, marginBottom: 5 }}>Weight trend vs plan</div>
+              <div style={{ fontSize: 11.5, color: "var(--text-soft)", lineHeight: 1.55 }}>
+                {fmtD(trend.from)} – {fmtD(a.window.end)}: <strong style={{ color: "var(--text)" }}>{trend.actualPerWeek >= 0 ? "+" : ""}{trend.actualPerWeek.toFixed(2)} kg/wk</strong>
+                {" "}(goal {trend.goalPerWeek >= 0 ? "+" : ""}{trend.goalPerWeek.toFixed(2)} kg/wk, {trend.weighIns} weigh-ins).{" "}
+                {trend.onTrack
+                  ? "On track — no target change needed."
+                  : `Suggest ${trend.delta > 0 ? "adding" : "cutting"} ${Math.abs(trend.delta)} kcal: ${trend.current.toLocaleString()} → ${trend.proposed.toLocaleString()} kcal/day.`}
+              </div>
+              {!trend.onTrack && actionable && a.canAccept && (
+                <div style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 5, lineHeight: 1.5 }}>
+                  Accepting the TDEE recalculates your target, so this step isn't needed then. "Keep current" lets you choose whether to take it.
+                </div>
+              )}
+              {!trend.onTrack && actionable && !a.canAccept && (
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+                  <button onClick={onApplyTrend}
+                    style={trendConfirming ? { ...fill("#dc2626"), color: "#fff" } : fill("#fbbf24")}>
+                    {trendConfirming ? "Confirm — lock in?" : `Apply ${trend.proposed.toLocaleString()}`}
+                  </button>
+                  {trendConfirming && <button onClick={onCancelTrend} style={ghost}>Cancel</button>}
+                  {!trendConfirming && <button onClick={onHoldTrend} style={ghost}>Hold current</button>}
+                </div>
+              )}
+            </div>
+          )}
+
           <div style={{ marginBottom: 12 }}>
             {a.reasons.length === 0 ? (
               <div style={{ fontSize: 11, color: "var(--text-soft)" }}>No concerns found in this period.</div>
@@ -4096,7 +4126,7 @@ function TdeeReviewSection({ state, schedule, assessment, due, recheck, preview,
 
           {a.canAccept && targetNow != null && targetIfAccepted != null && (
             <div style={{ fontSize: 10.5, color: "var(--text-soft)", lineHeight: 1.5, marginBottom: 12 }}>
-              If you accept, your daily target is recalculated for your current phase: <strong style={{ color: "var(--text)" }}>{targetNow.toLocaleString()} → {targetIfAccepted.toLocaleString()} kcal</strong>, and your calorie review window restarts today.
+              If you accept, your daily target is recalculated for your current phase: <strong style={{ color: "var(--text)" }}>{targetNow.toLocaleString()} → {targetIfAccepted.toLocaleString()} kcal</strong>, and your next review is {fmtDW(reviewSchedule({ lastEventDate: today, today }).dueDate)}.
             </div>
           )}
 
@@ -4117,7 +4147,7 @@ function TdeeReviewSection({ state, schedule, assessment, due, recheck, preview,
           )}
           {!due && (
             <div style={{ fontSize: 11, color: "var(--text-muted)", lineHeight: 1.5 }}>
-              This is a preview of your last 14 days. You can act on a review from {fmtD(schedule.dueDate)}.
+              This is a preview of your last 14 days. You can act on a review from {fmtDW(schedule.dueDate)}.
             </div>
           )}
         </div>
