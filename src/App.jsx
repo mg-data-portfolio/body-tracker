@@ -68,7 +68,6 @@ const ACTIVITY_LEVELS = [
 ];
 
 const REVIEW_DAYS = 14;        // 2-week locked review cycle
-const ADJUST_STEP = 150;       // standard nudge (kcal)
 
 function ageFromDOB(dob) {
   if (!dob) return null;
@@ -154,7 +153,7 @@ function linReg(points) {
 }
 const avg = (arr) => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null;
 
-// ═══ TDEE REVIEW LOGIC — BEGIN (tested copy; edit tdeeReview.js and regenerate, do not hand-edit) ═══
+// ═══ TDEE REVIEW LOGIC — BEGIN (App.jsx is the source of truth: edit this block here, then re-run the logic tests) ═══
 // tdeeReview.js — Stage 1: pure TDEE review logic.
 // No React, no localStorage, no UI. Everything here is a plain function so it can be
 // tested with fixed numbers. Later stages wire it into App.jsx.
@@ -187,6 +186,16 @@ const TDEE_DEFAULTS = {
   gapAmber: 300,
   gapRed: 500,
   creatineRateKgPerWeek: 0.5,
+  // weight-trend step (the "Weight trend vs plan" part of the review card)
+  trendWindowDays: 28,   // rate is measured over the last 28 days (a 14-day slope is too noisy to steer by)
+  trendMinPoints: 8,     // valid weigh-ins needed
+  trendMinSpanDays: 14,  // and they must span at least this many days
+  trendSlack: 0.03,      // kg/wk either side of the plan band that still counts as on track
+  trendCap: 200,         // max kcal change from one trend step
+  trendRound: 25,        // step is rounded to this many kcal
+  // optional Garmin active-calories note (informational only: never affects confidence or targets)
+  activityMinDays: 7,    // days logged needed in BOTH fortnights before a change is mentioned
+  activityChangePct: 15, // mention a change of at least this much
 };
 
 // Confounder flag ids (stored per day as entry.flags = [...ids]).
@@ -349,6 +358,25 @@ function assessReview({
   const p = { ...TDEE_DEFAULTS, ...params };
   const { start, end, days } = buildWindow(entries, today, p, windowFloor);
 
+  // ── Garmin active calories: this window vs the 14 days before it (informational only) ──
+  const activeVals = (from, to) => {
+    const v = [];
+    for (let d = from; d <= to; d = addDays(d, 1)) {
+      const k = entries[d]?.activeKcal;
+      if (k != null && Number(k) > 0) v.push(Number(k));
+    }
+    return v;
+  };
+  const actNow = activeVals(start, end);
+  const actPrev = activeVals(addDays(start, -p.windowDays), addDays(start, -1));
+  const actAvg = mean(actNow);
+  const actPrevAvg = mean(actPrev);
+  const actChangePct = actAvg != null && actPrevAvg ? ((actAvg - actPrevAvg) / actPrevAvg) * 100 : null;
+  const activity = {
+    days: actNow.length, prevDays: actPrev.length, avg: actAvg, prevAvg: actPrevAvg, changePct: actChangePct,
+    notable: actNow.length >= p.activityMinDays && actPrev.length >= p.activityMinDays && actChangePct != null && Math.abs(actChangePct) >= p.activityChangePct,
+  };
+
   // ── Counts ──
   const calorieDays = days.filter((d) => d.calories != null).length;
   const completeDays = days.filter((d) => d.complete).length;
@@ -466,6 +494,7 @@ function assessReview({
     window: { start, end },
     counts: { calorieDays, completeDays, validWeighIns, validWeek1, validWeek2, excludedWeighIns, incompleteRun, confounderDays, trainingDays, illnessDays, travelDays, creatineDays, noBowelDays },
     trend: { weeklyRate, weeklyPct, dailySurplus, scatterSd, meanWeight },
+    activity,
     avgCalories, rawTDEE, currentTDEE, gap,
     proposedTDEE, proposedChange, capped, smoothing, cap, isFirstReview,
     confidence, reasons, escapeRoute, gapOnlyRed,
@@ -473,6 +502,31 @@ function assessReview({
     suspectWeights, needsWeighInConfirmation: suspectWeights.length > 0,
     canAccept: confidence !== "red" && proposedTDEE != null,
     defaultAction: confidence === "green" ? "accept" : confidence === "amber" ? "keep" : null,
+  };
+}
+
+// ─── Weight trend vs plan (proportional step) ────────────────────────────────
+// points: [{ x: day number, y: kg }] over the last 28 days (never before the latest phase change).
+// band: { min, max } signed kg/week the phase aims for (cut is negative).
+// If the measured rate sits inside the band (plus a small slack) nothing changes. Otherwise the target moves
+// toward the middle of the band by the shortfall in energy terms: gap (kg/wk) x kcalPerKg / 7, capped and
+// rounded. Returns null when there is not enough data to steer by.
+function weightTrendStep({ points, band, current, params = {} }) {
+  const p = { ...TDEE_DEFAULTS, ...params };
+  if (!points || points.length < p.trendMinPoints || current == null || !band) return null;
+  const xs = points.map((q) => q.x);
+  if (Math.max(...xs) - Math.min(...xs) < p.trendMinSpanDays) return null;
+  const reg = linReg(points);
+  if (!reg) return null;
+  const actualPerWeek = reg.slope * 7;
+  const lo = Math.min(band.min, band.max), hi = Math.max(band.min, band.max);
+  const goalPerWeek = (lo + hi) / 2;
+  const inBand = actualPerWeek >= lo - p.trendSlack && actualPerWeek <= hi + p.trendSlack;
+  let delta = 0;
+  if (!inBand) delta = clamp(roundTo(((goalPerWeek - actualPerWeek) * p.kcalPerKg) / 7, p.trendRound), -p.trendCap, p.trendCap);
+  return {
+    actualPerWeek, goalPerWeek, bandMin: lo, bandMax: hi, delta,
+    current, proposed: current + delta, onTrack: delta === 0, weighIns: points.length,
   };
 }
 
@@ -553,18 +607,18 @@ function mergeEntries(existing, incoming) {
   return out;
 }
 
-// CSV: date,calories,weight_kg,body_fat_pct,protein_g,flags   (flags joined with "|")
+// CSV: date,calories,weight_kg,body_fat_pct,protein_g,flags,active_kcal   (flags joined with "|")
 function entriesToCSV(entries) {
-  const header = "date,calories,weight_kg,body_fat_pct,protein_g,flags";
+  const header = "date,calories,weight_kg,body_fat_pct,protein_g,flags,active_kcal";
   const rows = Object.keys(entries).sort().map((d) => {
     const e = entries[d] || {};
     const n = (v) => (v != null ? Number(v) : "");
-    return [d, n(e.calories), n(e.weight), n(e.bf), n(e.protein), Array.isArray(e.flags) ? e.flags.join("|") : ""].join(",");
+    return [d, n(e.calories), n(e.weight), n(e.bf), n(e.protein), Array.isArray(e.flags) ? e.flags.join("|") : "", n(e.activeKcal)].join(",");
   });
   return [header, ...rows].join("\n");
 }
 
-// Reads the new format and the old 5-column format.
+// Reads the new format and the older 5- and 6-column formats.
 function csvToEntries(text) {
   const lines = text.trim().split(/\r?\n/);
   const out = {};
@@ -581,6 +635,7 @@ function csvToEntries(text) {
     const pr = parseFloat(cols[4]); if (!isNaN(pr)) rec.protein = pr;
     const fl = (cols[5] || "").split("|").map((s) => s.trim()).filter(Boolean);
     if (fl.length) rec.flags = fl;
+    const ak = parseFloat(cols[6]); if (!isNaN(ak)) rec.activeKcal = ak;
     if (Object.keys(rec).length) out[date] = rec;
   }
   return out;
@@ -608,6 +663,7 @@ function parseEntry(e) {
     weight: e.weight != null ? Number(e.weight) : null,
     bf: e.bf != null ? Number(e.bf) : null,
     protein: e.protein != null ? Number(e.protein) : null,
+    activeKcal: e.activeKcal != null ? Number(e.activeKcal) : null,
   };
 }
 
@@ -905,6 +961,23 @@ function goalRatePerWeek(phase, magnitudeId, weightKg) {
   return phase === "cut" ? -mid : mid;
 }
 
+// Signed kg/week for display: "+0.14", "-0.30", and "0.00" (never "-0.00").
+const fmtRate = (v) => { const r = Math.round(v * 100) / 100; return r === 0 ? "0.00" : (r > 0 ? "+" : "") + r.toFixed(2); };
+
+// Signed weekly rate band for a phase (kg/week), e.g. Lean Bulk at 79.5 kg → { min: 0.08, max: 0.20 }. Cut is negative.
+function goalBandPerWeek(phase, magnitudeId, weightKg) {
+  if (!weightKg || phase === "maintain") return null;
+  const mag = PHASES[phase]?.magnitudes.find(m => m.id === magnitudeId);
+  if (!mag) return null;
+  const pct = phase === "cut"
+    ? { low: mag.deficitPct === 0.25 ? 0.0075 : mag.deficitPct === 0.20 ? 0.005 : 0.0025,
+        high: mag.deficitPct === 0.25 ? 0.01 : mag.deficitPct === 0.20 ? 0.0075 : 0.005 }
+    : { low: mag.deficitPct === -0.05 ? 0.001 : mag.deficitPct === -0.10 ? 0.0025 : 0.005,
+        high: mag.deficitPct === -0.05 ? 0.0025 : mag.deficitPct === -0.10 ? 0.005 : 0.01 };
+  const a = weightKg * pct.low, b = weightKg * pct.high;
+  return phase === "cut" ? { min: -b, max: -a } : { min: a, max: b };
+}
+
 // Delta badge: compare 7d avg calories to target
 function deltaBadge(avgCals, target, phase) {
   if (!avgCals || !target) return null;
@@ -934,7 +1007,7 @@ export default function App() {
   const [entries, setEntries] = useState({});
   const [activeDate, setActiveDate] = useState(today);
   const [morningForm, setMorningForm] = useState({ weight: "", bf: "" });
-  const [eveningForm, setEveningForm] = useState({ calories: "", protein: "" });
+  const [eveningForm, setEveningForm] = useState({ calories: "", protein: "", activeKcal: "" });
   const [loaded, setLoaded] = useState(false);
   const [saveStatus, setSaveStatus] = useState("");
   const [phase, setPhase] = useState("cut");
@@ -1235,8 +1308,8 @@ export default function App() {
   };
 
   const handleSaveEvening = async () => {
-    const ok = await saveFields({ calories: eveningForm.calories, protein: eveningForm.protein });
-    if (ok) setEveningForm({ calories: "", protein: "" });
+    const ok = await saveFields({ calories: eveningForm.calories, protein: eveningForm.protein, activeKcal: eveningForm.activeKcal });
+    if (ok) setEveningForm({ calories: "", protein: "", activeKcal: "" });
   };
 
   const handleDelete = async (date) => {
@@ -1251,7 +1324,7 @@ export default function App() {
     const e = entries[date] || {};
     setActiveDate(date);
     setMorningForm({ weight: e.weight ?? "", bf: e.bf ?? "" });
-    setEveningForm({ calories: e.calories ?? "", protein: e.protein ?? "" });
+    setEveningForm({ calories: e.calories ?? "", protein: e.protein ?? "", activeKcal: e.activeKcal ?? "" });
     setMorningExcludeEdit(null);
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
@@ -1260,7 +1333,7 @@ export default function App() {
     setActiveDate(today);
     setMorningExcludeEdit(null);
     setMorningForm({ weight: "", bf: "" });
-    setEveningForm({ calories: "", protein: "" });
+    setEveningForm({ calories: "", protein: "", activeKcal: "" });
   };
 
   // Step the active day by ±1 (never past today). Reuses handleEdit to load that day.
@@ -1733,30 +1806,12 @@ export default function App() {
   const trendDone = tdeeDue && cycle?.anchorDate != null && tdeeSched?.dueDate != null && cycle.anchorDate >= tdeeSched.dueDate;
   let review = null;
   if (tdeeAssessment && !trendDone && cycle && effectiveTDEE != null && phase !== "maintain") {
-    const from = latestPhaseChangeDate && latestPhaseChangeDate > tdeeAssessment.window.start ? latestPhaseChangeDate : tdeeAssessment.window.start;
-    const wPts = datedAll.filter(d => d.weight != null && d.date >= from && d.date <= tdeeAssessment.window.end).map(d => ({ x: d.ts, y: d.weight }));
-    const reg = wPts.length >= 4 ? linReg(wPts) : null;
-    const actualPerWeek = reg ? reg.slope * 7 * 86400000 : null;
-    const goalPerWeek = goalRatePerWeek(phase, magnitude, macroWeight); // kg/week from the phase band midpoint
-    if (actualPerWeek != null && goalPerWeek != null) {
-      let delta = 0;
-      const tol = 0.1; // kg/week tolerance: within this, hold
-      if (phase === "cut") {
-        if (actualPerWeek > goalPerWeek + tol) delta = -ADJUST_STEP;
-        else if (actualPerWeek < goalPerWeek - tol) delta = +ADJUST_STEP;
-      } else { // bulk
-        if (actualPerWeek < goalPerWeek - tol) delta = +ADJUST_STEP;
-        else if (actualPerWeek > goalPerWeek + tol) delta = -ADJUST_STEP;
-      }
-      review = {
-        actualPerWeek, goalPerWeek, delta,
-        current: baseTarget,
-        proposed: baseTarget + delta,
-        onTrack: delta === 0,
-        weighIns: wPts.length,
-        from,
-      };
-    }
+    // Rate is measured over the last 28 days (a 14-day slope is too noisy to steer by), never before the latest phase change.
+    const win28 = addDays(tdeeAssessment.window.end, -(TDEE_DEFAULTS.trendWindowDays - 1));
+    const from = latestPhaseChangeDate && latestPhaseChangeDate > win28 ? latestPhaseChangeDate : win28;
+    const wPts = datedAll.filter(d => d.weight != null && d.date >= from && d.date <= tdeeAssessment.window.end).map(d => ({ x: dayNum(d.date), y: d.weight }));
+    const step = weightTrendStep({ points: wPts, band: goalBandPerWeek(phase, magnitude, macroWeight), current: baseTarget, params: { kcalPerKg: tdeeParams.kcalPerKg } });
+    if (step) review = { ...step, from };
   }
   const reviewAttention = tdeeDue && ((tdeeAssessment != null && tdeeAssessment.confidence !== "red") || (review != null && !review.onTrack));
 
@@ -1836,7 +1891,7 @@ export default function App() {
     if (!review || review.onTrack) { keepTdee("hold"); return; }
     setDialog({
       title: "Keep your TDEE",
-      message: `Your weight is moving ${review.actualPerWeek >= 0 ? "+" : ""}${review.actualPerWeek.toFixed(2)} kg/wk against a goal of ${review.goalPerWeek >= 0 ? "+" : ""}${review.goalPerWeek.toFixed(2)}.\n`
+      message: `Over the last 4 weeks your weight is moving ${fmtRate(review.actualPerWeek)} kg/wk against a plan of ${fmtRate(review.bandMin)} to ${fmtRate(review.bandMax)}.\n`
         + `What should happen to your daily target?\n${review.current.toLocaleString()} → ${review.proposed.toLocaleString()} kcal (${review.delta > 0 ? "+" : ""}${review.delta}), or stay at ${review.current.toLocaleString()}.`,
       actions: [
         { label: `Keep TDEE · set target ${review.proposed.toLocaleString()}`, style: "primary", onClick: () => { setDialog(null); keepTdee("apply"); } },
@@ -2605,14 +2660,21 @@ export default function App() {
                   </div>
                 )}
               </div>
+              <div style={{ marginBottom: 14 }}>
+                <label style={labelStyle}>Active kcal (Garmin, optional)</label>
+                <input type="number" inputMode="numeric" value={eveningForm.activeKcal}
+                  placeholder={activeEntry.activeKcal != null ? String(activeEntry.activeKcal) : "e.g. 650"}
+                  onChange={e => setEveningForm(f => ({ ...f, activeKcal: e.target.value }))}
+                  style={inputStyle} />
+              </div>
               <button onClick={handleSaveEvening}
-                disabled={eveningForm.calories === "" && eveningForm.protein === ""}
+                disabled={eveningForm.calories === "" && eveningForm.protein === "" && eveningForm.activeKcal === ""}
                 style={{
-                  width: "100%", background: (eveningForm.calories === "" && eveningForm.protein === "") ? "var(--border)" : "#6366f1",
-                  color: (eveningForm.calories === "" && eveningForm.protein === "") ? "var(--text-dim)" : "#fff",
+                  width: "100%", background: (eveningForm.calories === "" && eveningForm.protein === "" && eveningForm.activeKcal === "") ? "var(--border)" : "#6366f1",
+                  color: (eveningForm.calories === "" && eveningForm.protein === "" && eveningForm.activeKcal === "") ? "var(--text-dim)" : "#fff",
                   border: "none", borderRadius: 6, padding: "9px", fontSize: 12, fontWeight: 600,
                   letterSpacing: "0.04em", textTransform: "uppercase",
-                  cursor: (eveningForm.calories === "" && eveningForm.protein === "") ? "default" : "pointer",
+                  cursor: (eveningForm.calories === "" && eveningForm.protein === "" && eveningForm.activeKcal === "") ? "default" : "pointer",
                 }}>
                 {eveningLogged ? "Update Evening" : "Save Evening"}
               </button>
@@ -4073,6 +4135,8 @@ function TdeeReviewSection({ state, schedule, assessment, due, recheck, preview,
             {cell("Avg calories", a.avgCalories != null ? Math.round(a.avgCalories).toLocaleString() : "—", "complete days only")}
             {cell("Weight trend", a.trend.weeklyRate != null ? `${a.trend.weeklyRate >= 0 ? "+" : ""}${a.trend.weeklyRate.toFixed(2)} kg/wk` : "—")}
             {cell("Raw TDEE", a.rawTDEE != null ? Math.round(a.rawTDEE).toLocaleString() : "—", a.gap != null ? `${a.gap >= 0 ? "+" : ""}${Math.round(a.gap)} vs current` : null)}
+            {a.activity && a.activity.days > 0 && cell("Active kcal (Garmin)", Math.round(a.activity.avg).toLocaleString(),
+              a.activity.changePct != null && a.activity.prevDays >= 3 ? `${a.activity.changePct >= 0 ? "+" : ""}${Math.round(a.activity.changePct)}% vs previous 14 days · ${a.activity.days} days logged` : `${a.activity.days} days logged`)}
             {cell("Current TDEE", a.currentTDEE != null ? a.currentTDEE.toLocaleString() : "—")}
             {cell("Proposed TDEE", a.proposedTDEE != null ? a.proposedTDEE.toLocaleString() : "—",
               a.proposedChange != null ? `${a.proposedChange >= 0 ? "+" : ""}${a.proposedChange} kcal${a.capped ? " (capped)" : ""}` : null, meta.color)}
@@ -4082,11 +4146,11 @@ function TdeeReviewSection({ state, schedule, assessment, due, recheck, preview,
             <div style={{ background: "var(--bg)", borderRadius: 8, padding: "10px 12px", marginBottom: 12 }}>
               <div style={{ fontSize: 9, letterSpacing: "0.08em", textTransform: "uppercase", color: "var(--text-dim)", fontWeight: 600, marginBottom: 5 }}>Weight trend vs plan</div>
               <div style={{ fontSize: 11.5, color: "var(--text-soft)", lineHeight: 1.55 }}>
-                {fmtD(trend.from)} – {fmtD(a.window.end)}: <strong style={{ color: "var(--text)" }}>{trend.actualPerWeek >= 0 ? "+" : ""}{trend.actualPerWeek.toFixed(2)} kg/wk</strong>
-                {" "}(goal {trend.goalPerWeek >= 0 ? "+" : ""}{trend.goalPerWeek.toFixed(2)} kg/wk, {trend.weighIns} weigh-ins).{" "}
+                {fmtD(trend.from)} – {fmtD(a.window.end)} (last 4 weeks): <strong style={{ color: "var(--text)" }}>{fmtRate(trend.actualPerWeek)} kg/wk</strong>
+                {" "}vs plan {fmtRate(trend.bandMin)} to {fmtRate(trend.bandMax)} kg/wk ({trend.weighIns} weigh-ins).{" "}
                 {trend.onTrack
                   ? "On track — no target change needed."
-                  : `Suggest ${trend.delta > 0 ? "adding" : "cutting"} ${Math.abs(trend.delta)} kcal: ${trend.current.toLocaleString()} → ${trend.proposed.toLocaleString()} kcal/day.`}
+                  : `Suggest ${trend.delta > 0 ? "adding" : "cutting"} ${Math.abs(trend.delta)} kcal to move toward the middle of the plan: ${trend.current.toLocaleString()} → ${trend.proposed.toLocaleString()} kcal/day.`}
               </div>
               {!trend.onTrack && actionable && a.canAccept && (
                 <div style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 5, lineHeight: 1.5 }}>
@@ -4116,6 +4180,11 @@ function TdeeReviewSection({ state, schedule, assessment, due, recheck, preview,
             ))}
             {a.isFirstReview && !a.escapeRoute && (
               <div style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 6 }}>First review: a larger step is allowed (50% of the gap, up to ±150 kcal).</div>
+            )}
+            {a.activity?.notable && (
+              <div style={{ fontSize: 10.5, color: "var(--text-soft)", lineHeight: 1.5, marginTop: 8, padding: "8px 10px", background: "var(--bg)", borderRadius: 8 }}>
+                Garmin active calories averaged {Math.round(a.activity.avg).toLocaleString()} kcal/day, {a.activity.changePct > 0 ? "up" : "down"} {Math.abs(Math.round(a.activity.changePct))}% on the previous 14 days. That can explain why raw TDEE moved. It is a rough watch estimate, so this review doesn't use it.
+              </div>
             )}
             {a.counts.noBowelDays >= 4 && (
               <div style={{ fontSize: 10.5, color: "var(--text-soft)", lineHeight: 1.5, marginTop: 8, padding: "8px 10px", background: "var(--bg)", borderRadius: 8 }}>
