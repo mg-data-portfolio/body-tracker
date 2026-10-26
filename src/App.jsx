@@ -1798,7 +1798,7 @@ export default function App() {
       })
     : null;
   const tdeeRechecking = tdeeDue && tdeeAssessment?.confidence === "red";
-  const targetIfAccepted = tdeeAssessment?.proposedTDEE != null ? calcTarget(tdeeAssessment.proposedTDEE, phase, magnitude) : null;
+  const tdeeFormulaTarget = tdeeAssessment?.proposedTDEE != null ? calcTarget(tdeeAssessment.proposedTDEE, phase, magnitude) : null;
 
   // ── Weight trend vs plan (the old "2-week calorie review", now a section of the single review card) ──
   // Measured over the same window as the TDEE review, but never reaching back before the latest phase change.
@@ -1813,6 +1813,9 @@ export default function App() {
     const step = weightTrendStep({ points: wPts, band: goalBandPerWeek(phase, magnitude, macroWeight), current: baseTarget, params: { kcalPerKg: tdeeParams.kcalPerKg } });
     if (step) review = { ...step, from };
   }
+  // ONE suggested target: when there is a 4-week weight reading, it decides (on track = unchanged, off plan = step toward
+  // the middle of the phase's range). With too little data (or Maintain) it falls back to new TDEE x phase %.
+  const targetIfAccepted = review ? review.proposed : tdeeFormulaTarget;
   const reviewAttention = tdeeDue && ((tdeeAssessment != null && tdeeAssessment.confidence !== "red") || (review != null && !review.onTrack));
 
   const updateDayFlags = async (date, patch) => {
@@ -1830,9 +1833,9 @@ export default function App() {
     if (!tdeeState || !tdeeAssessment?.canAccept) return;
     const nextState = applyDecision(tdeeState, "accept", tdeeAssessment, today);
     saveTdeeState(nextState);
-    // A new TDEE re-derives the daily target for the current phase (same formula as a phase change),
+    // Accepting sets the single suggested target (weight-trend based when there is a 4-week reading, else TDEE x phase %),
     // and restarts the 2-week calorie review so the two reviews never adjust the same period twice.
-    const nt = calcTarget(nextState.currentTDEE, phase, magnitude);
+    const nt = review ? review.proposed : calcTarget(nextState.currentTDEE, phase, magnitude);
     if (nt != null) { saveCycle({ anchorDate: today, lockedTarget: nt, syncedPhaseDate: latestPhaseChangeDate ?? cycle?.syncedPhaseDate ?? today }); recordLockedTarget(nt); }
     setPreviewTdee(false);
     showToast(`TDEE → ${nextState.currentTDEE.toLocaleString()} kcal${nt != null ? ` · target ${nt.toLocaleString()}` : ""}`);
@@ -1862,7 +1865,7 @@ export default function App() {
     setDialog({
       title: "Update your TDEE?",
       message: `TDEE ${a.currentTDEE.toLocaleString()} → ${a.proposedTDEE.toLocaleString()} kcal (${a.proposedChange >= 0 ? "+" : ""}${a.proposedChange}).\n`
-        + (targetIfAccepted != null ? `Your daily target is recalculated for your current phase: ${(baseTarget ?? 0).toLocaleString()} → ${targetIfAccepted.toLocaleString()} kcal.\n` : "")
+        + (targetIfAccepted != null ? `Your daily target: ${(baseTarget ?? 0).toLocaleString()} → ${targetIfAccepted.toLocaleString()} kcal.\n` : "")
         + `The weight-trend check is covered by this update. Your next review is ${fmtDayDate(reviewSchedule({ lastEventDate: today, today }).dueDate)}.`,
       actions: [
         { label: "Update TDEE", style: "primary", onClick: () => { setDialog(null); acceptTdee(); } },
@@ -4154,7 +4157,7 @@ function TdeeReviewSection({ state, schedule, assessment, due, recheck, preview,
               </div>
               {!trend.onTrack && actionable && a.canAccept && (
                 <div style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 5, lineHeight: 1.5 }}>
-                  Accepting the TDEE recalculates your target, so this step isn't needed then. "Keep current" lets you choose whether to take it.
+                  Accepting applies this suggested target along with the new TDEE. "Keep current" lets you choose whether to take it.
                 </div>
               )}
               {!trend.onTrack && actionable && !a.canAccept && (
@@ -4195,7 +4198,7 @@ function TdeeReviewSection({ state, schedule, assessment, due, recheck, preview,
 
           {a.canAccept && targetNow != null && targetIfAccepted != null && (
             <div style={{ fontSize: 10.5, color: "var(--text-soft)", lineHeight: 1.5, marginBottom: 12 }}>
-              If you accept, your daily target is recalculated for your current phase: <strong style={{ color: "var(--text)" }}>{targetNow.toLocaleString()} → {targetIfAccepted.toLocaleString()} kcal</strong>, and your next review is {fmtDW(reviewSchedule({ lastEventDate: today, today }).dueDate)}.
+              If you accept, your daily target changes: <strong style={{ color: "var(--text)" }}>{targetNow.toLocaleString()} → {targetIfAccepted.toLocaleString()} kcal</strong>, and your next review is {fmtDW(reviewSchedule({ lastEventDate: today, today }).dueDate)}.
             </div>
           )}
 
